@@ -37,6 +37,7 @@ use crate::types::{typeprinter::TypePrinter, Type, TypeVariableId};
 
 use std::collections::HashMap;
 use std::fmt::Display;
+use std::rc::Rc;
 
 use super::GeneralizedType;
 
@@ -53,7 +54,7 @@ pub struct TraitConstraintId(pub u32);
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ConstraintSignature {
     pub trait_id: TraitInfoId,
-    pub args: Vec<Type>,
+    pub args: Vec<Rc<Type>>,
     pub id: TraitConstraintId,
 }
 
@@ -211,7 +212,7 @@ impl TraitConstraint {
     /// Creates a TraitConstraint from the ConstraintSignature of the 'given' clause
     /// of a trait impl and the constraint from the impl itself. These constraints are always Callsite::Indirect.
     pub fn impl_given_constraint(
-        inner_id: TraitConstraintId, trait_id: TraitInfoId, args: Vec<Type>, impl_constraint: &TraitConstraint,
+        inner_id: TraitConstraintId, trait_id: TraitInfoId, args: Vec<Rc<Type>>, impl_constraint: &TraitConstraint,
         cache: &mut ModuleCache,
     ) -> TraitConstraint {
         let id = cache.next_trait_constraint_id();
@@ -237,7 +238,7 @@ impl TraitConstraint {
     pub fn int_constraint<'c>(
         int_type: TypeVariableId, location: Location<'c>, cache: &mut ModuleCache<'c>,
     ) -> TraitConstraint {
-        let args = vec![Type::TypeVariable(int_type)];
+        let args = vec![Rc::new(Type::TypeVariable(int_type))];
         let id = cache.next_trait_constraint_id();
 
         // Push a fake variable just to remember the location of this literal for error messages
@@ -256,11 +257,11 @@ impl TraitConstraint {
         self.required.signature.trait_id
     }
 
-    pub fn args(&self) -> &[Type] {
+    pub fn args(&self) -> &[Rc<Type>] {
         &self.required.signature.args
     }
 
-    pub fn args_mut(&mut self) -> &mut [Type] {
+    pub fn args_mut(&mut self) -> &mut [Rc<Type>] {
         &mut self.required.signature.args
     }
 

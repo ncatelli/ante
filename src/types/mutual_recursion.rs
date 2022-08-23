@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use crate::cache::MutualRecursionId;
 
 use crate::{
@@ -18,7 +20,7 @@ use super::{
 };
 
 pub(super) fn try_generalize_definition<'c>(
-    definition: &mut ast::Definition<'c>, t: Type, traits: TraitConstraints, cache: &mut ModuleCache<'c>,
+    definition: &mut ast::Definition<'c>, t: Rc<Type>, traits: TraitConstraints, cache: &mut ModuleCache<'c>,
 ) -> TraitConstraints {
     if !should_generalize(&definition.expr) {
         return traits;

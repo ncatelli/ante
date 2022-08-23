@@ -38,7 +38,7 @@ pub struct Context<'c> {
     /// many different monomorphised variants, each represented by a unique hir::DefinitionId.
     pub definitions: Definitions,
 
-    types: HashMap<(types::TypeInfoId, Vec<types::Type>), Type>,
+    types: HashMap<(types::TypeInfoId, Vec<Rc<types::Type>>), Type>,
 
     /// Compile-time mapping of variable -> definition for impls that were resolved
     /// after type inference. This is needed for definitions that are polymorphic in
@@ -134,7 +134,7 @@ impl<'c> Context<'c> {
     /// Follow the bindings as far as possible.
     /// Returns a non-type variable on success.
     /// Returns the last type variable found on failure.
-    fn find_binding(&self, id: TypeVariableId, fuel: u32) -> Result<&types::Type, TypeVariableId> {
+    fn find_binding(&self, id: TypeVariableId, fuel: u32) -> Result<&Rc<types::Type>, TypeVariableId> {
         use types::Type::*;
         use types::TypeBinding::*;
 
@@ -144,13 +144,19 @@ impl<'c> Context<'c> {
 
         let fuel = fuel - 1;
         match &self.cache.type_bindings[id.0] {
-            Bound(TypeVariable(id2) | Ref(id2)) => self.find_binding(*id2, fuel),
-            Bound(binding) => Ok(binding),
+            Bound(ty_inner) => match ty_inner.as_ref() {
+                TypeVariable(id) => self.find_binding(*id, fuel),
+                Ref(id) => self.find_binding(*id, fuel),
+                _ => Ok(ty_inner),
+            },
+
             Unbound(..) => {
                 for bindings in self.monomorphisation_bindings.iter().rev() {
                     match bindings.get(&id) {
-                        Some(TypeVariable(id2) | Ref(id2)) => return self.find_binding(*id2, fuel),
-                        Some(binding) => return Ok(&binding),
+                        Some(typ_inner) => match typ_inner.as_ref() {
+                            TypeVariable(id) | Ref(id) => return self.find_binding(*id, fuel),
+                            _ => return Ok(&typ_inner),
+                        },
                         None => (),
                     }
                 }
@@ -161,10 +167,10 @@ impl<'c> Context<'c> {
 
     /// If this type is a type variable, follow what it is bound to
     /// until we find the first type that isn't also a type variable.
-    fn follow_bindings_shallow<'a>(&'a self, typ: &'a types::Type) -> Result<&'a types::Type, TypeVariableId> {
+    fn follow_bindings_shallow<'a>(&'a self, typ: &'a Rc<types::Type>) -> Result<&'a Rc<types::Type>, TypeVariableId> {
         use types::Type::*;
 
-        match typ {
+        match typ.as_ref() {
             TypeVariable(id) => self.find_binding(*id, RECURSION_LIMIT),
             _ => Ok(typ),
         }
@@ -172,11 +178,11 @@ impl<'c> Context<'c> {
 
     /// Recursively follow all type variables in this type such that all Bound
     /// type variables are replaced with whatever they are bound to.
-    pub fn follow_all_bindings<'a>(&'a self, typ: &'a types::Type) -> types::Type {
+    pub fn follow_all_bindings<'a>(&'a self, typ: &'a Rc<types::Type>) -> Rc<types::Type> {
         self.follow_all_bindings_inner(typ, RECURSION_LIMIT)
     }
 
-    fn follow_all_bindings_inner<'a>(&'a self, typ: &'a types::Type, fuel: u32) -> types::Type {
+    fn follow_all_bindings_inner<'a>(&'a self, typ: &'a Rc<types::Type>, fuel: u32) -> Rc<types::Type> {
         use types::Type::*;
 
         if fuel == 0 {
@@ -184,27 +190,27 @@ impl<'c> Context<'c> {
         }
 
         let fuel = fuel - 1;
-        match typ {
+        match typ.as_ref() {
             TypeVariable(id) => match self.find_binding(*id, fuel) {
                 Ok(binding) => self.follow_all_bindings_inner(binding, fuel),
-                Err(id) => TypeVariable(id),
+                Err(id) => Rc::new(TypeVariable(id)),
             },
             Primitive(_) => typ.clone(),
             Function(f) => {
                 let f = types::FunctionType {
                     parameters: fmap(&f.parameters, |param| self.follow_all_bindings_inner(param, fuel)),
-                    return_type: Box::new(self.follow_all_bindings_inner(&f.return_type, fuel)),
-                    environment: Box::new(self.follow_all_bindings_inner(&f.environment, fuel)),
-                    effects: Box::new(self.follow_all_bindings_inner(&f.effects, fuel)),
+                    return_type: self.follow_all_bindings_inner(&f.return_type, fuel),
+                    environment: self.follow_all_bindings_inner(&f.environment, fuel),
+                    effects: self.follow_all_bindings_inner(&f.effects, fuel),
                     is_varargs: f.is_varargs,
                 };
-                Function(f)
+                Rc::new(Function(f))
             },
             UserDefined(_) => typ.clone(),
             TypeApplication(con, args) => {
                 let con = self.follow_all_bindings_inner(con, fuel);
                 let args = fmap(args, |arg| self.follow_all_bindings_inner(arg, fuel));
-                TypeApplication(Box::new(con), args)
+                Rc::new(TypeApplication(con, args))
             },
             Ref(_) => typ.clone(),
             Struct(fields, id) => match self.find_binding(*id, fuel) {
@@ -215,7 +221,7 @@ impl<'c> Context<'c> {
                         .map(|(name, typ)| (name.clone(), self.follow_all_bindings_inner(typ, fuel)))
                         .collect();
 
-                    Struct(fields, *id)
+                    Rc::new(Struct(fields, *id))
                 },
             },
             Effects(effects) => self.follow_all_effect_bindings_inner(effects, fuel),
@@ -224,7 +230,7 @@ impl<'c> Context<'c> {
 
     fn follow_all_effect_bindings_inner<'a>(
         &'a self, effects: &'a types::effects::EffectSet, fuel: u32,
-    ) -> types::Type {
+    ) -> Rc<types::Type> {
         let replacement = match self.find_binding(effects.replacement, fuel) {
             Ok(binding) => return self.follow_all_bindings_inner(binding, fuel),
             Err(id) => id,
@@ -235,10 +241,12 @@ impl<'c> Context<'c> {
             (*id, args)
         });
 
-        types::Type::Effects(types::effects::EffectSet { effects, replacement })
+        Rc::new(types::Type::Effects(types::effects::EffectSet { effects, replacement }))
     }
 
-    fn size_of_struct_type(&mut self, info: &types::TypeInfo, fields: &[types::Field], args: &[types::Type]) -> usize {
+    fn size_of_struct_type(
+        &mut self, info: &types::TypeInfo, fields: &[types::Field], args: &[Rc<types::Type>],
+    ) -> usize {
         let bindings = typechecker::type_application_bindings(info, args, &self.cache);
 
         fields
@@ -251,7 +259,7 @@ impl<'c> Context<'c> {
     }
 
     fn size_of_union_type(
-        &mut self, info: &types::TypeInfo, variants: &[types::TypeConstructor<'c>], args: &[types::Type],
+        &mut self, info: &types::TypeInfo, variants: &[types::TypeConstructor<'c>], args: &[Rc<types::Type>],
     ) -> usize {
         let bindings = typechecker::type_application_bindings(info, args, &self.cache);
 
@@ -264,7 +272,7 @@ impl<'c> Context<'c> {
         }
     }
 
-    fn size_of_user_defined_type(&mut self, id: TypeInfoId, args: &[types::Type]) -> usize {
+    fn size_of_user_defined_type(&mut self, id: TypeInfoId, args: &[Rc<types::Type>]) -> usize {
         let info = &self.cache[id];
         assert!(info.args.len() == args.len(), "Kind error during llvm code generation");
 
@@ -300,10 +308,10 @@ impl<'c> Context<'c> {
         }
     }
 
-    fn size_of_type(&mut self, typ: &types::Type) -> usize {
+    fn size_of_type(&mut self, typ: &Rc<types::Type>) -> usize {
         use types::PrimitiveType::*;
         use types::Type::*;
-        match typ {
+        match typ.as_ref() {
             Primitive(IntegerType(kind)) => self.integer_bit_count(*kind) as usize / 8,
             Primitive(FloatType) => 8,
             Primitive(CharType) => 1,
@@ -314,18 +322,21 @@ impl<'c> Context<'c> {
             Function(..) => Self::ptr_size(),
 
             TypeVariable(id) => {
-                let binding = self.find_binding(*id, RECURSION_LIMIT).unwrap_or(&UNBOUND_TYPE).clone();
+                let binding = self.find_binding(*id, RECURSION_LIMIT).unwrap_or(&Rc::new(UNBOUND_TYPE)).clone();
                 self.size_of_type(&binding)
             },
 
             UserDefined(id) => self.size_of_user_defined_type(*id, &[]),
 
-            TypeApplication(typ, args) => match self.follow_bindings_shallow(typ.as_ref()) {
-                Ok(UserDefined(id)) => {
-                    let id = *id;
-                    self.size_of_user_defined_type(id, args)
+            TypeApplication(typ, args) => match self.follow_bindings_shallow(typ) {
+                Ok(typ) => match typ.as_ref() {
+                    UserDefined(id) => {
+                        let id = *id;
+                        self.size_of_user_defined_type(id, args)
+                    },
+                    Primitive(Ptr) => Self::ptr_size(),
+                    _ => unreachable!("Kind error inside size_of_type"),
                 },
-                Ok(Primitive(Ptr)) => Self::ptr_size(),
                 _ => unreachable!("Kind error inside size_of_type"),
             },
 
@@ -358,7 +369,7 @@ impl<'c> Context<'c> {
     }
 
     fn convert_struct_type(
-        &mut self, id: TypeInfoId, info: &types::TypeInfo, fields: &[types::Field<'c>], args: Vec<types::Type>,
+        &mut self, id: TypeInfoId, info: &types::TypeInfo, fields: &[types::Field<'c>], args: Vec<Rc<types::Type>>,
     ) -> Type {
         let bindings = typechecker::type_application_bindings(info, &args, &self.cache);
 
@@ -380,8 +391,8 @@ impl<'c> Context<'c> {
     /// and return its field types.
     fn find_largest_union_variant(
         &mut self, variants: &[types::TypeConstructor<'c>], bindings: &TypeBindings,
-    ) -> Option<Vec<types::Type>> {
-        let variants: Vec<Vec<types::Type>> =
+    ) -> Option<Vec<Rc<types::Type>>> {
+        let variants: Vec<Vec<_>> =
             fmap(variants, |variant| fmap(&variant.args, |arg| typechecker::bind_typevars(arg, bindings, &self.cache)));
 
         variants.into_iter().max_by_key(|variant| variant.iter().map(|arg| self.size_of_type(arg)).sum::<usize>())
@@ -394,7 +405,7 @@ impl<'c> Context<'c> {
 
     fn convert_union_type(
         &mut self, id: TypeInfoId, info: &types::TypeInfo, variants: &[types::TypeConstructor<'c>],
-        args: Vec<types::Type>,
+        args: Vec<Rc<types::Type>>,
     ) -> Type {
         let bindings = typechecker::type_application_bindings(info, &args, &self.cache);
 
@@ -415,7 +426,7 @@ impl<'c> Context<'c> {
         t
     }
 
-    fn convert_user_defined_type(&mut self, id: TypeInfoId, args: Vec<types::Type>) -> Type {
+    fn convert_user_defined_type(&mut self, id: TypeInfoId, args: Vec<Rc<types::Type>>) -> Type {
         let info = &self.cache[id];
         assert!(info.args.len() == args.len(), "Kind error during monomorphisation");
 
@@ -437,7 +448,7 @@ impl<'c> Context<'c> {
         typ
     }
 
-    fn empty_closure_environment(&self, environment: &types::Type) -> bool {
+    fn empty_closure_environment(&self, environment: &Rc<types::Type>) -> bool {
         self.follow_bindings_shallow(environment).map_or(false, |env| env.is_unit(&self.cache))
     }
 
@@ -447,7 +458,6 @@ impl<'c> Context<'c> {
     }
 
     pub fn convert_type_inner(&mut self, typ: &types::Type, fuel: u32) -> Type {
-        use types::PrimitiveType::Ptr;
         use types::Type::*;
 
         if fuel == 0 {
@@ -496,17 +506,17 @@ impl<'c> Context<'c> {
                 let typ = self.follow_bindings_shallow(typ);
 
                 match typ {
-                    Ok(Primitive(Ptr) | Ref(_)) => Type::Primitive(hir::PrimitiveType::Pointer),
-                    Ok(UserDefined(id)) => {
-                        let id = *id;
-                        self.convert_user_defined_type(id, args)
-                    },
-                    Ok(other) => {
-                        unreachable!(
+                    Ok(typ_inner) => match typ_inner.as_ref() {
+                        Primitive(_) | Ref(_) => Type::Primitive(hir::PrimitiveType::Pointer),
+                        UserDefined(id) => {
+                            let id = *id;
+                            self.convert_user_defined_type(id, args)
+                        },
+                        other => unreachable!(
                             "Type {} requires 0 type args but was applied to {:?}",
                             other.display(&self.cache),
                             args
-                        );
+                        ),
                     },
                     Err(var) => {
                         unreachable!("Tried to apply an unbound type variable (id {}), args: {:?}", var.0, args);
@@ -540,11 +550,14 @@ impl<'c> Context<'c> {
                 use types::Type::*;
 
                 match self.find_binding(id, RECURSION_LIMIT) {
-                    Ok(Primitive(PrimitiveType::IntegerType(kind))) => self.convert_integer_kind(*kind),
-                    Err(_) => DEFAULT_INTEGER_KIND,
-                    Ok(other) => {
-                        unreachable!("convert_integer_kind called with non-integer type {}", other.display(&self.cache))
+                    Ok(typ_inner) => match typ_inner.as_ref() {
+                        Primitive(PrimitiveType::IntegerType(kind)) => self.convert_integer_kind(*kind),
+                        other => unreachable!(
+                            "convert_integer_kind called with non-integer type {}",
+                            other.display(&self.cache)
+                        ),
                     },
+                    Err(_) => DEFAULT_INTEGER_KIND,
                 }
             },
             IntegerKind::I8 => hir::IntegerKind::I8,
@@ -637,13 +650,13 @@ impl<'c> Context<'c> {
         definition.reference()
     }
 
-    pub fn lookup_definition(&self, id: DefinitionInfoId, typ: &types::Type) -> Option<Definition> {
+    pub fn lookup_definition(&self, id: DefinitionInfoId, typ: &Rc<types::Type>) -> Option<Definition> {
         let typ = self.follow_all_bindings(typ);
         self.definitions.get(id, typ).cloned()
     }
 
     fn push_monomorphisation_bindings(
-        &mut self, instantiation_mapping: &Rc<TypeBindings>, typ: &types::Type,
+        &mut self, instantiation_mapping: &Rc<TypeBindings>, typ: &Rc<types::Type>,
         definition: &crate::cache::DefinitionInfo<'c>,
     ) {
         if !instantiation_mapping.is_empty() {
@@ -748,7 +761,7 @@ impl<'c> Context<'c> {
     }
 
     fn monomorphise_definition_id(
-        &mut self, id: DefinitionInfoId, variable_id: VariableId, typ: &types::Type,
+        &mut self, id: DefinitionInfoId, variable_id: VariableId, typ: &Rc<types::Type>,
         instantiation_mapping: &Rc<TypeBindings>,
     ) -> Definition {
         if let Some(value) = self.lookup_definition(id, typ) {
@@ -826,10 +839,10 @@ impl<'c> Context<'c> {
 
     /// This function is 'make_extern' rathern than 'monomorphise_extern' since extern declarations
     /// shouldn't be monomorphised across multiple types.
-    fn make_extern(&mut self, id: DefinitionInfoId, typ: &types::Type) -> Definition {
+    fn make_extern(&mut self, id: DefinitionInfoId, typ: &Rc<types::Type>) -> Definition {
         // extern definitions should only be declared once - never duplicated & monomorphised.
         // For this reason their value is always stored with the Unit type in the definitions map.
-        if let Some(value) = self.lookup_definition(id, &UNBOUND_TYPE) {
+        if let Some(value) = self.lookup_definition(id, &Rc::new(UNBOUND_TYPE)) {
             self.definitions.insert(id, typ.clone(), value.clone());
             return value;
         }
@@ -849,13 +862,13 @@ impl<'c> Context<'c> {
         // - (Id, Type, ParentId) for locals, to get rid of "all" and "local" fields within
         //   self.definitions and the duplication it requires.
         self.definitions.insert(id, typ.clone(), definition.clone());
-        self.definitions.insert(id, UNBOUND_TYPE.clone(), definition.clone());
+        self.definitions.insert(id, Rc::new(UNBOUND_TYPE), definition.clone());
         definition
     }
 
     /// Wrap the given Ast in a new DefinitionInfo and store it
     fn define_type_constructor(
-        &mut self, definition_rhs: hir::Ast, original_id: DefinitionInfoId, typ: types::Type,
+        &mut self, definition_rhs: hir::Ast, original_id: DefinitionInfoId, typ: Rc<types::Type>,
     ) -> Definition {
         let def = if matches!(&definition_rhs, hir::Ast::Lambda(_)) {
             let variable = self.next_unique_id();
@@ -934,7 +947,7 @@ impl<'c> Context<'c> {
     ///
     /// PRE-REQUISITE: `typ` must equal `self.follow_all_bindings(typ)`
     fn desugar_pattern(
-        &mut self, pattern: &ast::Ast<'c>, definition_id: hir::DefinitionId, typ: types::Type,
+        &mut self, pattern: &ast::Ast<'c>, definition_id: hir::DefinitionId, typ: Rc<types::Type>,
         definitions: &mut Vec<hir::Ast>,
     ) {
         use {
@@ -1199,8 +1212,8 @@ impl<'c> Context<'c> {
         hir::Ast::Tuple(hir::Tuple { fields })
     }
 
-    fn size_of_type_arg0(&mut self, ptr_type: &types::Type) -> u32 {
-        match self.follow_all_bindings(ptr_type) {
+    fn size_of_type_arg0(&mut self, ptr_type: &Rc<types::Type>) -> u32 {
+        match self.follow_all_bindings(ptr_type).as_ref() {
             types::Type::TypeApplication(_, arg_types) => {
                 assert_eq!(arg_types.len(), 1);
                 self.size_of_type(&arg_types[0]) as u32
@@ -1209,7 +1222,7 @@ impl<'c> Context<'c> {
         }
     }
 
-    fn convert_builtin(&mut self, args: &[ast::Ast<'c>], result_type: &types::Type) -> hir::Ast {
+    fn convert_builtin(&mut self, args: &[ast::Ast<'c>], result_type: &Rc<types::Type>) -> hir::Ast {
         use hir::Builtin::*;
         let arg = match &args[0] {
             ast::Ast::Literal(ast::Literal { kind: ast::LiteralKind::String(string), .. }) => string,
@@ -1396,20 +1409,28 @@ impl<'c> Context<'c> {
         hir::Ast::Sequence(hir::Sequence { statements })
     }
 
-    fn get_field_index(&self, field_name: &str, typ: &types::Type) -> u32 {
+    fn get_field_index(&self, field_name: &str, typ: &Rc<types::Type>) -> u32 {
         use types::Type::*;
 
         match self.follow_bindings_shallow(typ) {
-            Ok(UserDefined(id)) => self.cache[*id].find_field(field_name).unwrap().0,
-            Ok(TypeApplication(typ, args)) => {
-                match self.follow_bindings_shallow(typ) {
+            Ok(typ_inner) => match typ_inner.as_ref() {
+                UserDefined(id) => self.cache[*id].find_field(field_name).unwrap().0,
+                TypeApplication(typ, args) => match self.follow_bindings_shallow(typ).as_ref() {
                     // Pass through ref types transparently
-                    Ok(types::Type::Ref(_)) => self.get_field_index(field_name, &args[0]),
+                    Ok(inner) if matches!(inner.as_ref(), types::Type::Ref(_)) => {
+                        self.get_field_index(field_name, &args[0])
+                    },
                     // These last 2 cases are the same. They're duplicated to avoid another follow_bindings_shallow call.
                     Ok(typ) => self.get_field_index(field_name, typ),
                     _ => self.get_field_index(field_name, typ),
-                }
+                },
+                _ => unreachable!(
+                    "get_field_index called with type {} that doesn't have a '{}' field",
+                    typ.display(&self.cache),
+                    field_name
+                ),
             },
+
             _ => unreachable!(
                 "get_field_index called with type {} that doesn't have a '{}' field",
                 typ.display(&self.cache),
@@ -1432,10 +1453,11 @@ impl<'c> Context<'c> {
         let lhs_type = self.follow_all_bindings(member_access.lhs.get_type().unwrap());
         let index = self.get_field_index(&member_access.field, &lhs_type);
 
-        let ref_type = match lhs_type {
-            types::Type::TypeApplication(constructor, args) => match self.follow_bindings_shallow(constructor.as_ref())
-            {
-                Ok(types::Type::Ref(_)) => Some(self.convert_type(&args[0])),
+        let ref_type = match lhs_type.as_ref() {
+            types::Type::TypeApplication(constructor, args) => match self.follow_bindings_shallow(constructor) {
+                Ok(typ_inner) if matches!(typ_inner.as_ref(), &types::Type::Ref(_)) => {
+                    Some(self.convert_type(&args[0]))
+                },
                 _ => None,
             },
             _ => None,

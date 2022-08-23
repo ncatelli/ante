@@ -17,6 +17,7 @@
 //! impl to the `ast::Variable` the TraitConstraint originated from, so that variable
 //! has the correct definition to compile during codegen. For any impl it fails to solve,
 //! a compile-time error will be issued.
+use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 
 use crate::cache::{ImplInfoId, ModuleCache};
@@ -141,14 +142,14 @@ fn find_int_constraint_impl<'c>(
     let typ = typechecker::follow_bindings_in_cache_and_map(&constraint.args()[0], bindings, cache);
 
     use super::{IntegerKind, PrimitiveType, Type};
-    match &typ {
+    match typ.as_ref() {
         Type::Primitive(PrimitiveType::IntegerType(_)) => Ok(UnificationBindings::empty()),
         Type::TypeVariable(_) => {
             // The `Int a` constraint has special defaulting rules - since we know this typevar is
             // unbound, bind it to the default integer type (i32) here.
             // try_unify is used here to avoid performing the binding in case this impl isn't
             // selected to be used.
-            let default_int_type = Type::Primitive(PrimitiveType::IntegerType(IntegerKind::I32));
+            let default_int_type = Rc::new(Type::Primitive(PrimitiveType::IntegerType(IntegerKind::I32)));
             typechecker::try_unify(
                 &typ,
                 &default_int_type,

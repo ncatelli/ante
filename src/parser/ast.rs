@@ -48,7 +48,7 @@ pub enum LiteralKind {
 pub struct Literal<'a> {
     pub kind: LiteralKind,
     pub location: Location<'a>,
-    pub typ: Option<types::Type>,
+    pub typ: Option<Rc<types::Type>>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -83,7 +83,7 @@ pub struct Variable<'a> {
     /// A unique ID that can be used to identify this variable node
     pub id: Option<VariableId>,
 
-    pub typ: Option<types::Type>,
+    pub typ: Option<Rc<types::Type>>,
 }
 
 // TODO: Remove. This is only used for experimenting with ante-lsp
@@ -122,7 +122,7 @@ pub struct Lambda<'a> {
     pub required_traits: Vec<RequiredTrait>,
 
     pub location: Location<'a>,
-    pub typ: Option<types::Type>,
+    pub typ: Option<Rc<types::Type>>,
 }
 
 // TODO: Remove. This is only used for experimenting with ante-lsp
@@ -136,7 +136,7 @@ pub struct FunctionCall<'a> {
     pub function: Box<Ast<'a>>,
     pub args: Vec<Ast<'a>>,
     pub location: Location<'a>,
-    pub typ: Option<types::Type>,
+    pub typ: Option<Rc<types::Type>>,
 }
 
 impl<'a> FunctionCall<'a> {
@@ -159,7 +159,7 @@ pub struct Definition<'a> {
     pub location: Location<'a>,
     pub level: Option<LetBindingLevel>,
     pub info: Option<DefinitionInfoId>,
-    pub typ: Option<types::Type>,
+    pub typ: Option<Rc<types::Type>>,
 }
 
 /// if condition then expression else expression
@@ -169,7 +169,7 @@ pub struct If<'a> {
     pub then: Box<Ast<'a>>,
     pub otherwise: Option<Box<Ast<'a>>>,
     pub location: Location<'a>,
-    pub typ: Option<types::Type>,
+    pub typ: Option<Rc<types::Type>>,
 }
 
 /// match expression
@@ -187,7 +187,7 @@ pub struct Match<'a> {
     pub decision_tree: Option<DecisionTree>,
 
     pub location: Location<'a>,
-    pub typ: Option<types::Type>,
+    pub typ: Option<Rc<types::Type>>,
 }
 
 /// Type nodes in the AST, different from the representation of types during type checking.
@@ -235,7 +235,7 @@ pub struct TypeDefinition<'a> {
     pub definition: TypeDefinitionBody<'a>,
     pub location: Location<'a>,
     pub type_info: Option<TypeInfoId>,
-    pub typ: Option<types::Type>,
+    pub typ: Option<Rc<types::Type>>,
 }
 
 /// lhs : rhs
@@ -244,7 +244,7 @@ pub struct TypeAnnotation<'a> {
     pub lhs: Box<Ast<'a>>,
     pub rhs: Type<'a>,
     pub location: Location<'a>,
-    pub typ: Option<types::Type>,
+    pub typ: Option<Rc<types::Type>>,
 }
 
 /// import Path1 . Path2 ... PathN
@@ -252,7 +252,7 @@ pub struct TypeAnnotation<'a> {
 pub struct Import<'a> {
     pub path: Vec<String>,
     pub location: Location<'a>,
-    pub typ: Option<types::Type>,
+    pub typ: Option<Rc<types::Type>>,
     pub module_id: Option<ModuleId>,
     pub symbols: HashSet<String>,
 }
@@ -276,7 +276,7 @@ pub struct TraitDefinition<'a> {
     pub level: Option<LetBindingLevel>,
     pub location: Location<'a>,
     pub trait_info: Option<TraitInfoId>,
-    pub typ: Option<types::Type>,
+    pub typ: Option<Rc<types::Type>>,
 }
 
 /// impl TraitName TraitArg1 TraitArg2 ... TraitArgN
@@ -294,8 +294,8 @@ pub struct TraitImpl<'a> {
     pub location: Location<'a>,
     pub trait_info: Option<TraitInfoId>,
     pub impl_id: Option<ImplInfoId>,
-    pub typ: Option<types::Type>,
-    pub trait_arg_types: Vec<types::Type>, // = fmap(trait_args, convert_type)
+    pub typ: Option<Rc<types::Type>>,
+    pub trait_arg_types: Vec<Rc<types::Type>>, // = fmap(trait_args, convert_type)
 }
 
 /// return expression
@@ -303,7 +303,7 @@ pub struct TraitImpl<'a> {
 pub struct Return<'a> {
     pub expression: Box<Ast<'a>>,
     pub location: Location<'a>,
-    pub typ: Option<types::Type>,
+    pub typ: Option<Rc<types::Type>>,
 }
 
 /// statement1
@@ -314,7 +314,7 @@ pub struct Return<'a> {
 pub struct Sequence<'a> {
     pub statements: Vec<Ast<'a>>,
     pub location: Location<'a>,
-    pub typ: Option<types::Type>,
+    pub typ: Option<Rc<types::Type>>,
 }
 
 /// extern declaration
@@ -329,7 +329,7 @@ pub struct Extern<'a> {
     pub declarations: Vec<TypeAnnotation<'a>>,
     pub level: Option<LetBindingLevel>,
     pub location: Location<'a>,
-    pub typ: Option<types::Type>,
+    pub typ: Option<Rc<types::Type>>,
 }
 
 /// lhs.field
@@ -340,7 +340,7 @@ pub struct MemberAccess<'a> {
     pub location: Location<'a>,
     /// True if this is an offset .& operation
     pub is_offset: bool,
-    pub typ: Option<types::Type>,
+    pub typ: Option<Rc<types::Type>>,
 }
 
 /// lhs := rhs
@@ -349,7 +349,7 @@ pub struct Assignment<'a> {
     pub lhs: Box<Ast<'a>>,
     pub rhs: Box<Ast<'a>>,
     pub location: Location<'a>,
-    pub typ: Option<types::Type>,
+    pub typ: Option<Rc<types::Type>>,
 }
 
 /// effect Name arg1 arg2 ... argN with
@@ -366,7 +366,7 @@ pub struct EffectDefinition<'a> {
     pub level: Option<LetBindingLevel>,
     pub location: Location<'a>,
     pub effect_info: Option<EffectInfoId>,
-    pub typ: Option<types::Type>,
+    pub typ: Option<Rc<types::Type>>,
 }
 
 /// handle expression
@@ -383,7 +383,7 @@ pub struct Handle<'a> {
     pub expression: Box<Ast<'a>>,
     pub branches: Vec<(Ast<'a>, Ast<'a>)>,
     pub location: Location<'a>,
-    pub typ: Option<types::Type>,
+    pub typ: Option<Rc<types::Type>>,
 }
 
 #[derive(Debug, Clone)]

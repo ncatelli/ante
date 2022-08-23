@@ -61,6 +61,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 pub mod builtin;
 mod scope;
@@ -389,8 +390,12 @@ impl NameResolver {
         trait_info.definitions.push(id);
 
         // TODO: Is this still necessary? Can we remove the args field of trait_info below?
-        let args =
-            trait_info.typeargs.iter().chain(trait_info.fundeps.iter()).map(|id| Type::TypeVariable(*id)).collect();
+        let args = trait_info
+            .typeargs
+            .iter()
+            .chain(trait_info.fundeps.iter())
+            .map(|id| Rc::new(Type::TypeVariable(*id)))
+            .collect();
 
         let info = &mut cache.definition_infos[id.0];
         info.trait_info = Some((trait_id, args));
@@ -495,7 +500,7 @@ impl NameResolver {
 
     #[allow(clippy::too_many_arguments)]
     fn push_trait_impl<'c>(
-        &mut self, trait_id: TraitInfoId, args: Vec<Type>, definitions: Vec<DefinitionInfoId>,
+        &mut self, trait_id: TraitInfoId, args: Vec<Rc<Type>>, definitions: Vec<DefinitionInfoId>,
         trait_impl: &'c mut ast::TraitImpl<'c>, given: Vec<ConstraintSignature>, cache: &mut ModuleCache<'c>,
         location: Location<'c>,
     ) -> ImplInfoId {
@@ -605,8 +610,8 @@ impl<'c> NameResolver {
     }
 
     /// Converts an ast::Type to a types::Type, expects all typevars to be in scope
-    pub fn convert_type(&mut self, cache: &mut ModuleCache<'c>, ast_type: &ast::Type<'c>) -> Type {
-        match ast_type {
+    pub fn convert_type(&mut self, cache: &mut ModuleCache<'c>, ast_type: &ast::Type<'c>) -> Rc<Type> {
+        let rt_typ = match ast_type {
             ast::Type::Integer(kind, _) => Type::Primitive(PrimitiveType::IntegerType(*kind)),
             ast::Type::Float(_) => Type::Primitive(PrimitiveType::FloatType),
             ast::Type::Char(_) => Type::Primitive(PrimitiveType::CharType),
@@ -616,9 +621,9 @@ impl<'c> NameResolver {
             ast::Type::Unit(_) => Type::UNIT,
             ast::Type::Function(args, ret, is_varargs, _) => {
                 let parameters = fmap(args, |arg| self.convert_type(cache, arg));
-                let return_type = Box::new(self.convert_type(cache, ret));
-                let environment = Box::new(Type::UNIT);
-                let effects = Box::new(cache.next_type_variable(self.let_binding_level));
+                let return_type = self.convert_type(cache, ret);
+                let environment = Rc::new(Type::UNIT);
+                let effects = cache.next_type_variable(self.let_binding_level);
                 let is_varargs = *is_varargs;
                 Type::Function(FunctionType { parameters, return_type, environment, is_varargs, effects })
             },
@@ -642,7 +647,7 @@ impl<'c> NameResolver {
                 },
             },
             ast::Type::TypeApplication(constructor, args, _) => {
-                let constructor = Box::new(self.convert_type(cache, constructor));
+                let constructor = self.convert_type(cache, constructor);
                 let args = fmap(args, |arg| self.convert_type(cache, arg));
                 Type::TypeApplication(constructor, args)
             },
@@ -657,7 +662,7 @@ impl<'c> NameResolver {
                     },
                 };
 
-                Type::TypeApplication(Box::new(pair), args)
+                Type::TypeApplication(Rc::new(pair), args)
             },
             ast::Type::Reference(_) => {
                 // When translating ref types, all have a hidden lifetime variable that is unified
@@ -668,7 +673,9 @@ impl<'c> NameResolver {
                 let lifetime_variable = cache.next_type_variable_id(self.let_binding_level);
                 Type::Ref(lifetime_variable)
             },
-        }
+        };
+
+        Rc::new(rt_typ)
     }
 
     /// The collect* family of functions recurses over an irrefutable pattern, either declaring or
@@ -982,15 +989,15 @@ impl<'c> Resolvable<'c> for ast::Match<'c> {
 /// Given "type T a b c = ..." return
 /// forall a b c. args -> T a b c
 fn create_variant_constructor_type(
-    resolver: &mut NameResolver, parent_type_id: TypeInfoId, args: Vec<Type>, cache: &mut ModuleCache,
+    resolver: &mut NameResolver, parent_type_id: TypeInfoId, args: Vec<Rc<Type>>, cache: &mut ModuleCache,
 ) -> GeneralizedType {
     let info = &cache.type_infos[parent_type_id.0];
     let mut result = Type::UserDefined(parent_type_id);
 
     // Apply T to [a, b, c] if [a, b, c] is non-empty
     if !info.args.is_empty() {
-        let type_variables = fmap(&info.args, |id| Type::TypeVariable(*id));
-        result = Type::TypeApplication(Box::new(result), type_variables);
+        let type_variables = fmap(&info.args, |id| Rc::new(Type::TypeVariable(*id)));
+        result = Type::TypeApplication(Rc::new(result), type_variables);
     }
 
     let mut type_args = info.args.clone();
@@ -999,12 +1006,12 @@ fn create_variant_constructor_type(
     if !args.is_empty() {
         let effect_id = cache.next_type_variable_id(resolver.let_binding_level);
         type_args.push(effect_id);
-        let effects = Box::new(Type::TypeVariable(effect_id));
+        let effects = Rc::new(Type::TypeVariable(effect_id));
 
         result = Type::Function(FunctionType {
             parameters: args,
-            return_type: Box::new(result),
-            environment: Box::new(Type::UNIT),
+            return_type: Rc::new(result),
+            environment: Rc::new(Type::UNIT),
             effects,
             is_varargs: false,
         });
@@ -1012,9 +1019,9 @@ fn create_variant_constructor_type(
 
     // finally, wrap the type in a forall if it has type variables
     if !type_args.is_empty() {
-        GeneralizedType::PolyType(type_args, result)
+        GeneralizedType::PolyType(type_args, Rc::new(result))
     } else {
-        GeneralizedType::MonoType(result)
+        GeneralizedType::MonoType(Rc::new(result))
     }
 }
 

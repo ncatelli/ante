@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, rc::Rc};
 
 use crate::{cache::DefinitionInfoId, types};
 
@@ -15,14 +15,14 @@ pub struct Definitions {
 
 type DefinitionMap = HashMap<DefinitionKey, Definition>;
 
-type DefinitionKey = (DefinitionInfoId, types::Type);
+type DefinitionKey = (DefinitionInfoId, Rc<types::Type>);
 
 impl Definitions {
     pub fn new() -> Self {
         Self { all: HashMap::new(), local: vec![HashMap::new()] }
     }
 
-    pub fn get(&self, id: DefinitionInfoId, typ: types::Type) -> Option<&Definition> {
+    pub fn get(&self, id: DefinitionInfoId, typ: Rc<types::Type>) -> Option<&Definition> {
         let locals = self.local.last().unwrap();
         if let Some(definition) = locals.get(&(id, typ.clone())) {
             return Some(definition);
@@ -31,7 +31,7 @@ impl Definitions {
         self.all.get(&(id, typ))
     }
 
-    pub fn insert(&mut self, id: DefinitionInfoId, typ: types::Type, definition: Definition) {
+    pub fn insert(&mut self, id: DefinitionInfoId, typ: Rc<types::Type>, definition: Definition) {
         let locals = self.local.last_mut().unwrap();
         locals.insert((id, typ.clone()), definition.clone());
         self.all.insert((id, typ), definition);

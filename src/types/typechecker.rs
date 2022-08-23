@@ -57,7 +57,7 @@ use super::{error, GeneralizedType, TypeInfoBody};
 pub static CURRENT_LEVEL: AtomicUsize = AtomicUsize::new(INITIAL_LEVEL);
 
 /// A sparse set of type bindings, used by try_unify
-pub type TypeBindings = HashMap<TypeVariableId, Type>;
+pub type TypeBindings = HashMap<TypeVariableId, Rc<Type>>;
 
 /// The result of `try_unify`: either a set of type bindings to perform,
 /// or an error message of which types failed to unify.
@@ -101,23 +101,27 @@ impl UnificationBindings {
 }
 
 pub struct TypeResult {
-    typ: Type,
+    typ: Rc<Type>,
     traits: TraitConstraints,
     effects: EffectSet,
 }
 
 impl TypeResult {
-    fn new(typ: Type, traits: TraitConstraints, cache: &mut ModuleCache) -> TypeResult {
+    fn new(typ: Rc<Type>, traits: TraitConstraints, cache: &mut ModuleCache) -> TypeResult {
         Self { typ, traits, effects: EffectSet::any(cache) }
     }
 
     fn of(typ: Type, cache: &mut ModuleCache) -> TypeResult {
-        Self { typ, traits: vec![], effects: EffectSet::any(cache) }
+        Self { typ: Rc::new(typ), traits: vec![], effects: EffectSet::any(cache) }
     }
 
-    fn with_type(mut self, typ: Type) -> TypeResult {
+    fn with_type(mut self, typ: Rc<Type>) -> TypeResult {
         self.typ = typ;
         self
+    }
+
+    fn with_bare_type(self, typ: Type) -> TypeResult {
+        self.with_type(Rc::new(typ))
     }
 
     fn combine(&mut self, other: &mut Self, cache: &mut ModuleCache) {
@@ -136,14 +140,14 @@ impl TypeResult {
 /// was one of the variables given in the definition of the user-defined-type:
 /// `type Foo var1 var2 ... varN = ...` and each `arg` corresponds to the generic argument
 /// of the type somewhere in the program, e.g: `foo : Foo arg1 arg2 ... argN`
-pub fn type_application_bindings<'c>(info: &TypeInfo<'c>, typeargs: &[Type], cache: &ModuleCache) -> TypeBindings {
+pub fn type_application_bindings<'c>(info: &TypeInfo<'c>, typeargs: &[Rc<Type>], cache: &ModuleCache) -> TypeBindings {
     info.args
         .iter()
         .copied()
         .zip(typeargs.iter().cloned())
         .filter_map(|(a, b)| {
             let b = follow_bindings_in_cache(&b, cache);
-            if TypeVariable(a) != b {
+            if &TypeVariable(a) != b.as_ref() {
                 Some((a, b))
             } else {
                 None
@@ -153,18 +157,18 @@ pub fn type_application_bindings<'c>(info: &TypeInfo<'c>, typeargs: &[Type], cac
 }
 
 /// Given `a` returns `ref a`
-fn ref_of(typ: Type, cache: &mut ModuleCache) -> Type {
+fn ref_of(typ: Rc<Type>, cache: &mut ModuleCache) -> Rc<Type> {
     let new_var = next_type_variable_id(cache);
-    let constructor = Box::new(Type::Ref(new_var));
-    TypeApplication(constructor, vec![typ])
+    let constructor = Rc::new(Type::Ref(new_var));
+    Rc::new(TypeApplication(constructor, vec![typ]))
 }
 
 /// Replace any typevars found in typevars_to_replace with the
 /// associated value in the same table, leave them otherwise
 fn replace_typevars<'c>(
-    typ: &Type, typevars_to_replace: &HashMap<TypeVariableId, TypeVariableId>, cache: &ModuleCache<'c>,
-) -> Type {
-    let typevars_to_replace = typevars_to_replace.iter().map(|(key, id)| (*key, TypeVariable(*id))).collect();
+    typ: &Rc<Type>, typevars_to_replace: &HashMap<TypeVariableId, TypeVariableId>, cache: &ModuleCache<'c>,
+) -> Rc<Type> {
+    let typevars_to_replace = typevars_to_replace.iter().map(|(key, id)| (*key, Rc::new(TypeVariable(*id)))).collect();
 
     bind_typevars(typ, &typevars_to_replace, cache)
 }
@@ -175,7 +179,7 @@ fn replace_typevars<'c>(
 /// Note that unlike `generalize(typ).instantiate(..)`, this will
 /// replace all type variables rather than only type variables
 /// that have not originated from an outer scope.
-pub fn replace_all_typevars<'c>(types: &[Type], cache: &mut ModuleCache<'c>) -> (Vec<Type>, TypeBindings) {
+pub fn replace_all_typevars<'c>(types: &[Rc<Type>], cache: &mut ModuleCache<'c>) -> (Vec<Rc<Type>>, TypeBindings) {
     let mut bindings = HashMap::new();
     let types = fmap(types, |typ| replace_all_typevars_with_bindings(typ, &mut bindings, cache));
     (types, bindings)
@@ -185,36 +189,39 @@ pub fn replace_all_typevars<'c>(types: &[Type], cache: &mut ModuleCache<'c>) -> 
 /// to lookup what each variable should be bound to, inserting a
 /// fresh type variable into new_bindings if that type variable was not present.
 pub fn replace_all_typevars_with_bindings<'c>(
-    typ: &Type, new_bindings: &mut TypeBindings, cache: &mut ModuleCache<'c>,
-) -> Type {
-    match typ {
-        Primitive(p) => Primitive(*p),
+    typ: &Rc<Type>, new_bindings: &mut TypeBindings, cache: &mut ModuleCache<'c>,
+) -> Rc<Type> {
+    match typ.as_ref() {
+        Primitive(_) => typ.clone(),
 
-        TypeVariable(id) => replace_typevar_with_binding(*id, new_bindings, TypeVariable, cache),
+        TypeVariable(id) => replace_typevar_with_binding(*id, new_bindings, |id| Rc::new(TypeVariable(id)), cache),
 
         Function(function) => {
             let parameters = fmap(&function.parameters, |parameter| {
                 replace_all_typevars_with_bindings(parameter, new_bindings, cache)
             });
-            let return_type = Box::new(replace_all_typevars_with_bindings(&function.return_type, new_bindings, cache));
-            let environment = Box::new(replace_all_typevars_with_bindings(&function.environment, new_bindings, cache));
+            let return_type = replace_all_typevars_with_bindings(&function.return_type, new_bindings, cache);
+            let environment = replace_all_typevars_with_bindings(&function.environment, new_bindings, cache);
             let is_varargs = function.is_varargs;
-            let effects = Box::new(replace_all_typevars_with_bindings(&function.effects, new_bindings, cache));
-            Function(FunctionType { parameters, return_type, environment, is_varargs, effects })
+            let effects = replace_all_typevars_with_bindings(&function.effects, new_bindings, cache);
+            Rc::new(Function(FunctionType { parameters, return_type, environment, is_varargs, effects }))
         },
-        UserDefined(id) => UserDefined(*id),
+        UserDefined(_) => typ.clone(),
 
         // We must recurse on the lifetime variable since they are unified as normal type variables
-        Ref(lifetime) => match replace_typevar_with_binding(*lifetime, new_bindings, Ref, cache) {
-            TypeVariable(new_lifetime) => Ref(new_lifetime),
-            Ref(new_lifetime) => Ref(new_lifetime),
-            _ => unreachable!("Bound Ref lifetime to non-lifetime type"),
+        Ref(lifetime) => {
+            let binding = replace_typevar_with_binding(*lifetime, new_bindings, |id| Rc::new(Ref(id)), cache);
+            match binding.as_ref() {
+                TypeVariable(new_lifetime) => Rc::new(Ref(*new_lifetime)),
+                Ref(_) => binding,
+                _ => unreachable!("Bound Ref lifetime to non-lifetime type"),
+            }
         },
 
         TypeApplication(typ, args) => {
             let typ = replace_all_typevars_with_bindings(typ, new_bindings, cache);
             let args = fmap(args, |arg| replace_all_typevars_with_bindings(arg, new_bindings, cache));
-            TypeApplication(Box::new(typ), args)
+            Rc::new(TypeApplication(typ, args))
         },
         Struct(fields, id) => {
             if let Some(binding) = new_bindings.get(id) {
@@ -228,7 +235,7 @@ pub fn replace_all_typevars_with_bindings<'c>(
                     })
                     .collect();
 
-                Struct(fields, *id)
+                Rc::new(Struct(fields, *id))
             }
         },
         Effects(effects) => effects.replace_all_typevars_with_bindings(new_bindings, cache),
@@ -241,9 +248,9 @@ pub fn replace_all_typevars_with_bindings<'c>(
 /// `default` should be either TypeVariable or Ref and controls which kind of type gets
 /// created that wraps the newly-instantiated TypeVariableId if one is made.
 fn replace_typevar_with_binding<'c>(
-    id: TypeVariableId, new_bindings: &mut TypeBindings, default: fn(TypeVariableId) -> Type,
+    id: TypeVariableId, new_bindings: &mut TypeBindings, default: fn(TypeVariableId) -> Rc<Type>,
     cache: &mut ModuleCache<'c>,
-) -> Type {
+) -> Rc<Type> {
     if let Bound(typ) = &cache.type_bindings[id.0] {
         replace_all_typevars_with_bindings(&typ.clone(), new_bindings, cache)
     } else if let Some(var) = new_bindings.get(&id) {
@@ -260,44 +267,47 @@ fn replace_typevar_with_binding<'c>(
 /// Compared to `replace_all_typevars_with_bindings`, this function does not instantiate
 /// unbound type variables that were not in type_bindings. Thus if type_bindings is empty,
 /// this function will just clone the original Type.
-pub fn bind_typevars<'c>(typ: &Type, type_bindings: &TypeBindings, cache: &ModuleCache<'c>) -> Type {
-    match typ {
-        Primitive(p) => Primitive(*p),
+pub fn bind_typevars<'c>(typ: &Rc<Type>, type_bindings: &TypeBindings, cache: &ModuleCache<'c>) -> Rc<Type> {
+    match typ.as_ref() {
+        Primitive(_) => typ.clone(),
 
-        TypeVariable(id) => bind_typevar(*id, type_bindings, TypeVariable, cache),
+        TypeVariable(id) => bind_typevar(*id, type_bindings, |id| Rc::new(TypeVariable(id)), cache),
 
         Function(function) => {
             let parameters = fmap(&function.parameters, |parameter| bind_typevars(parameter, type_bindings, cache));
-            let return_type = Box::new(bind_typevars(&function.return_type, type_bindings, cache));
-            let environment = Box::new(bind_typevars(&function.environment, type_bindings, cache));
+            let return_type = bind_typevars(&function.return_type, type_bindings, cache);
+            let environment = bind_typevars(&function.environment, type_bindings, cache);
             let is_varargs = function.is_varargs;
-            let effects = Box::new(bind_typevars(&function.effects, type_bindings, cache));
-            Function(FunctionType { parameters, return_type, environment, is_varargs, effects })
+            let effects = bind_typevars(&function.effects, type_bindings, cache);
+            Rc::new(Function(FunctionType { parameters, return_type, environment, is_varargs, effects }))
         },
-        UserDefined(id) => UserDefined(*id),
+        UserDefined(_) => typ.clone(),
 
-        Ref(lifetime) => match bind_typevar(*lifetime, type_bindings, Ref, cache) {
-            TypeVariable(new_lifetime) => Ref(new_lifetime),
-            Ref(new_lifetime) => Ref(new_lifetime),
+        Ref(lifetime) => match bind_typevar(*lifetime, type_bindings, |id| Rc::new(Ref(id)), cache).as_ref() {
+            TypeVariable(new_lifetime) => Rc::new(Ref(*new_lifetime)),
+            Ref(new_lifetime) => Rc::new(Ref(*new_lifetime)),
             _ => unreachable!("Bound Ref lifetime to non-lifetime type"),
         },
 
         TypeApplication(typ, args) => {
             let typ = bind_typevars(typ, type_bindings, cache);
             let args = fmap(args, |arg| bind_typevars(arg, type_bindings, cache));
-            TypeApplication(Box::new(typ), args)
+            Rc::new(TypeApplication(typ, args))
         },
         Struct(fields, id) => {
             match type_bindings.get(&id) {
-                Some(TypeVariable(binding_id)) => {
-                    let fields = fields
-                        .iter()
-                        .map(|(name, field)| (name.clone(), bind_typevars(field, type_bindings, cache)))
-                        .collect();
-                    Struct(fields, *binding_id)
+                Some(binding) => match binding.as_ref() {
+                    TypeVariable(binding_id) => {
+                        let fields = fields
+                            .iter()
+                            .map(|(name, field)| (name.clone(), bind_typevars(field, type_bindings, cache)))
+                            .collect();
+                        Rc::new(Struct(fields, *binding_id))
+                    },
+
+                    // TODO: Should we follow all typevars here?
+                    _ => binding.clone(),
                 },
-                // TODO: Should we follow all typevars here?
-                Some(binding) => binding.clone(),
                 None => {
                     if let Bound(typ) = &cache.type_bindings[id.0] {
                         bind_typevars(&typ.clone(), type_bindings, cache)
@@ -310,7 +320,7 @@ pub fn bind_typevars<'c>(typ: &Type, type_bindings: &TypeBindings, cache: &Modul
                             })
                             .collect();
 
-                        Struct(fields, *id)
+                        Rc::new(Struct(fields, *id))
                     }
                 },
             }
@@ -323,8 +333,8 @@ pub fn bind_typevars<'c>(typ: &Type, type_bindings: &TypeBindings, cache: &Modul
 /// and it is found in the type_bindings. If a type_binding wasn't found, a
 /// default TypeVariable or Ref is constructed by passing the relevant constructor to `default`.
 fn bind_typevar<'c>(
-    id: TypeVariableId, type_bindings: &TypeBindings, default: fn(TypeVariableId) -> Type, cache: &ModuleCache<'c>,
-) -> Type {
+    id: TypeVariableId, type_bindings: &TypeBindings, default: fn(TypeVariableId) -> Rc<Type>, cache: &ModuleCache<'c>,
+) -> Rc<Type> {
     // TODO: This ordering of checking type_bindings first is important.
     // There seems to be an issue currently where forall-bound variables
     // can be bound in the cache, so checking the cache for bindings first
@@ -387,7 +397,7 @@ pub fn next_type_variable_id(cache: &mut ModuleCache) -> TypeVariableId {
     cache.next_type_variable_id(level)
 }
 
-pub fn next_type_variable(cache: &mut ModuleCache) -> Type {
+pub fn next_type_variable(cache: &mut ModuleCache) -> Rc<Type> {
     let level = LetBindingLevel(CURRENT_LEVEL.load(Ordering::SeqCst));
     cache.next_type_variable(level)
 }
@@ -430,7 +440,7 @@ fn to_trait_constraints(
 impl GeneralizedType {
     pub fn instantiate<'b>(
         &self, mut constraints: TraitConstraints, cache: &mut ModuleCache<'b>,
-    ) -> (Type, TraitConstraints, TypeBindings) {
+    ) -> (Rc<Type>, TraitConstraints, TypeBindings) {
         // Note that the returned type is no longer a PolyType,
         // this means it is now monomorphic and not forall-quantified
         match self {
@@ -453,7 +463,8 @@ impl GeneralizedType {
                     }
                 }
 
-                let type_bindings = typevars_to_replace.into_iter().map(|(k, v)| (k, TypeVariable(v))).collect();
+                let type_bindings =
+                    typevars_to_replace.into_iter().map(|(k, v)| (k, Rc::new(TypeVariable(v)))).collect();
                 (typ, constraints, type_bindings)
             },
         }
@@ -515,10 +526,12 @@ impl OccursResult {
     }
 
     pub(super) fn then_all<'a>(
-        mut self, types: impl IntoIterator<Item = &'a Type>, mut f: impl FnMut(&'a Type) -> OccursResult,
+        mut self, types: impl IntoIterator<Item = &'a Rc<Type>>, mut f: impl FnMut(&'a Type) -> OccursResult,
     ) -> OccursResult {
         if !self.occurs {
             for typ in types {
+                let typ = typ.as_ref();
+
                 let mut other = f(typ);
                 self.occurs = other.occurs;
                 self.level_bindings.append(&mut other.level_bindings);
@@ -582,9 +595,9 @@ pub(super) fn typevars_match<'c>(
 
 /// Returns what a given type is bound to, following all typevar links until it reaches an Unbound one.
 pub fn follow_bindings_in_cache_and_map<'b>(
-    typ: &Type, bindings: &UnificationBindings, cache: &ModuleCache<'b>,
-) -> Type {
-    match typ {
+    typ: &Rc<Type>, bindings: &UnificationBindings, cache: &ModuleCache<'b>,
+) -> Rc<Type> {
+    match typ.as_ref() {
         TypeVariable(id) | Ref(id) => match find_binding(*id, bindings, cache) {
             Bound(typ) => follow_bindings_in_cache_and_map(&typ, bindings, cache),
             Unbound(..) => typ.clone(),
@@ -593,8 +606,8 @@ pub fn follow_bindings_in_cache_and_map<'b>(
     }
 }
 
-pub fn follow_bindings_in_cache<'b>(typ: &Type, cache: &ModuleCache<'b>) -> Type {
-    match typ {
+pub fn follow_bindings_in_cache<'b>(typ: &Rc<Type>, cache: &ModuleCache<'b>) -> Rc<Type> {
+    match typ.as_ref() {
         TypeVariable(id) | Ref(id) => match &cache.type_bindings[id.0] {
             Bound(typ) => follow_bindings_in_cache(typ, cache),
             Unbound(..) => typ.clone(),
@@ -614,9 +627,13 @@ pub fn follow_bindings_in_cache<'b>(typ: &Type, cache: &ModuleCache<'b>) -> Type
 /// This function performs the bulk of the work for the various unification functions.
 #[allow(clippy::nonminimal_bool)]
 pub fn try_unify_with_bindings_inner<'b>(
-    t1: &Type, t2: &Type, bindings: &mut UnificationBindings, location: Location<'b>, cache: &mut ModuleCache<'b>,
+    t1: &Rc<Type>, t2: &Rc<Type>, bindings: &mut UnificationBindings, location: Location<'b>,
+    cache: &mut ModuleCache<'b>,
 ) -> Result<(), ()> {
-    match (t1, t2) {
+    let t1_inner = t1.as_ref();
+    let t2_inner = t1.as_ref();
+
+    match (t1_inner, t2_inner) {
         (Primitive(p1), Primitive(p2)) if p1 == p2 => Ok(()),
 
         (UserDefined(id1), UserDefined(id2)) if id1 == id2 => Ok(()),
@@ -673,21 +690,30 @@ pub fn try_unify_with_bindings_inner<'b>(
 
         // Follow any bindings here for convenience so we don't have to check if a or b
         // are bound in all Struct cases below.
-        (Struct(_, var), t2) | (t2, Struct(_, var)) if matches!(&cache.type_bindings[var.0], Bound(_)) => {
-            match &cache.type_bindings[var.0] {
-                Bound(bound) => try_unify_with_bindings_inner(&bound.clone(), t2, bindings, location, cache),
-                _ => unreachable!(),
-            }
+        (Struct(_, var), _) if matches!(&cache.type_bindings[var.0], Bound(_)) => match &cache.type_bindings[var.0] {
+            Bound(bound) => try_unify_with_bindings_inner(&bound.clone(), t2, bindings, location, cache),
+            _ => unreachable!(),
+        },
+
+        (_, Struct(_, var)) if matches!(&cache.type_bindings[var.0], Bound(_)) => match &cache.type_bindings[var.0] {
+            Bound(bound) => try_unify_with_bindings_inner(&bound.clone(), t1, bindings, location, cache),
+            _ => unreachable!(),
         },
 
         (Struct(fields1, rest1), Struct(fields2, rest2)) => {
             bind_struct_fields(fields1, fields2, *rest1, *rest2, bindings, location, cache)
         },
 
-        (Struct(fields1, rest), other) | (other, Struct(fields1, rest)) => {
+        (Struct(fields1, rest), other) => {
             let fields2 = get_fields(other, &[], bindings, cache)?;
             bind_struct_fields_subset(fields1, &fields2, bindings, location, cache)?;
-            bindings.bindings.insert(*rest, other.clone());
+            bindings.bindings.insert(*rest, t2.clone());
+            Ok(())
+        },
+        (other, Struct(fields1, rest)) => {
+            let fields2 = get_fields(other, &[], bindings, cache)?;
+            bind_struct_fields_subset(fields1, &fields2, bindings, location, cache)?;
+            bindings.bindings.insert(*rest, t1.clone());
             Ok(())
         },
 
@@ -701,9 +727,11 @@ pub fn try_unify_with_bindings_inner<'b>(
 }
 
 fn bind_struct_fields<'c>(
-    fields1: &BTreeMap<String, Type>, fields2: &BTreeMap<String, Type>, rest1: TypeVariableId, rest2: TypeVariableId,
-    bindings: &mut UnificationBindings, location: Location<'c>, cache: &mut ModuleCache<'c>,
+    fields1: &BTreeMap<String, Rc<Type>>, fields2: &BTreeMap<String, Rc<Type>>, rest1: TypeVariableId,
+    rest2: TypeVariableId, bindings: &mut UnificationBindings, location: Location<'c>, cache: &mut ModuleCache<'c>,
 ) -> Result<(), ()> {
+    let rest1_typ_var = Rc::new(TypeVariable(rest1));
+    let rest2_typ_var = Rc::new(TypeVariable(rest2));
     let mut new_fields = fields1.clone();
     for (name, typ2) in fields2 {
         if let Some(typ1) = new_fields.get(name) {
@@ -714,26 +742,19 @@ fn bind_struct_fields<'c>(
     }
 
     if new_fields.len() != fields1.len() && new_fields.len() != fields2.len() {
-        try_unify_type_variable_with_bindings(
-            rest1,
-            &TypeVariable(rest1),
-            &TypeVariable(rest2),
-            bindings,
-            location,
-            cache,
-        )?;
+        try_unify_type_variable_with_bindings(rest1, &rest1_typ_var, &rest2_typ_var, bindings, location, cache)?;
         let new_rest = new_row_variable(rest1, rest2, cache);
-        let new_struct = Struct(new_fields, new_rest);
+        let new_struct = Rc::new(Struct(new_fields, new_rest));
         // We set rest1 := rest2 above, so we should insert into rest2 to bind both structs
         bindings.bindings.insert(rest2, new_struct);
     } else if new_fields.len() != fields1.len() {
         // Set 1 := 2
-        let struct2 = Struct(new_fields, rest2);
-        try_unify_type_variable_with_bindings(rest1, &TypeVariable(rest1), &struct2, bindings, location, cache)?;
+        let struct2 = Rc::new(Struct(new_fields, rest2));
+        try_unify_type_variable_with_bindings(rest1, &rest1_typ_var, &struct2, bindings, location, cache)?;
     } else if new_fields.len() != fields2.len() {
         // Set 2 := 1
-        let struct1 = Struct(new_fields, rest1);
-        try_unify_type_variable_with_bindings(rest2, &TypeVariable(rest2), &struct1, bindings, location, cache)?;
+        let struct1 = Rc::new(Struct(new_fields, rest1));
+        try_unify_type_variable_with_bindings(rest2, &rest2_typ_var, &struct1, bindings, location, cache)?;
     }
 
     Ok(())
@@ -754,7 +775,7 @@ fn new_row_variable(row1: TypeVariableId, row2: TypeVariableId, cache: &mut Modu
 
 /// Like bind_struct_fields but enforces `fields` must be a subset of the fields in the template.
 fn bind_struct_fields_subset<'c>(
-    fields: &BTreeMap<String, Type>, template: &BTreeMap<String, Type>, bindings: &mut UnificationBindings,
+    fields: &BTreeMap<String, Rc<Type>>, template: &BTreeMap<String, Rc<Type>>, bindings: &mut UnificationBindings,
     location: Location<'c>, cache: &mut ModuleCache<'c>,
 ) -> Result<(), ()> {
     // FIXME: Enforcing a struct type's fields are a subset of
@@ -789,8 +810,8 @@ fn bind_struct_fields_subset<'c>(
 }
 
 fn get_fields<'c>(
-    typ: &Type, args: &[Type], bindings: &mut UnificationBindings, cache: &mut ModuleCache<'c>,
-) -> Result<BTreeMap<String, Type>, ()> {
+    typ: &Type, args: &[Rc<Type>], bindings: &mut UnificationBindings, cache: &mut ModuleCache<'c>,
+) -> Result<BTreeMap<String, Rc<Type>>, ()> {
     match typ {
         UserDefined(id) => {
             let info = &cache[*id];
@@ -818,9 +839,11 @@ fn get_fields<'c>(
                 },
             }
         },
-        TypeApplication(constructor, args) => match follow_bindings_in_cache_and_map(constructor, bindings, cache) {
-            Ref(_) => get_fields(&args[0], &[], bindings, cache),
-            other => get_fields(&other, args, bindings, cache),
+        TypeApplication(constructor, args) => {
+            match follow_bindings_in_cache_and_map(constructor, bindings, cache).as_ref() {
+                Ref(_) => get_fields(&args[0], &[], bindings, cache),
+                other => get_fields(&other, args, bindings, cache),
+            }
         },
         Struct(fields, rest) => match &cache.type_bindings[rest.0] {
             Bound(binding) => get_fields(&binding.clone(), args, bindings, cache),
@@ -837,7 +860,7 @@ fn get_fields<'c>(
 /// Unify a single type variable (id arising from the type a) with an expected type b.
 /// Follows the given TypeBindings in bindings and the cache if a is Bound.
 fn try_unify_type_variable_with_bindings<'c>(
-    id: TypeVariableId, a: &Type, b: &Type, bindings: &mut UnificationBindings, location: Location<'c>,
+    id: TypeVariableId, a: &Rc<Type>, b: &Rc<Type>, bindings: &mut UnificationBindings, location: Location<'c>,
     cache: &mut ModuleCache<'c>,
 ) -> Result<(), ()> {
     match find_binding(id, bindings, cache) {
@@ -863,8 +886,8 @@ fn try_unify_type_variable_with_bindings<'c>(
 }
 
 pub fn try_unify_with_bindings<'b>(
-    t1: &Type, t2: &Type, bindings: &mut UnificationBindings, location: Location<'b>, cache: &mut ModuleCache<'b>,
-    error_message: &str,
+    t1: &Rc<Type>, t2: &Rc<Type>, bindings: &mut UnificationBindings, location: Location<'b>,
+    cache: &mut ModuleCache<'b>, error_message: &str,
 ) -> Result<(), ErrorMessage<'b>> {
     match try_unify_with_bindings_inner(t1, t2, bindings, location, cache) {
         Ok(()) => Ok(()),
@@ -876,7 +899,7 @@ pub fn try_unify_with_bindings<'b>(
 /// set of type bindings, and returning all the newly-created bindings on success,
 /// or the unification error message on error.
 pub fn try_unify<'c>(
-    t1: &Type, t2: &Type, location: Location<'c>, cache: &mut ModuleCache<'c>, error_message: &str,
+    t1: &Rc<Type>, t2: &Rc<Type>, location: Location<'c>, cache: &mut ModuleCache<'c>, error_message: &str,
 ) -> UnificationResult<'c> {
     let mut bindings = UnificationBindings::empty();
     try_unify_with_bindings(t1, t2, &mut bindings, location, cache, error_message).map(|()| bindings)
@@ -885,7 +908,7 @@ pub fn try_unify<'c>(
 /// Try to unify all the given type, with the given bindings in scope.
 /// Will add new bindings to the given TypeBindings and return them all on success.
 pub fn try_unify_all_with_bindings<'c>(
-    vec1: &[Type], vec2: &[Type], mut bindings: UnificationBindings, location: Location<'c>,
+    vec1: &[Rc<Type>], vec2: &[Rc<Type>], mut bindings: UnificationBindings, location: Location<'c>,
     cache: &mut ModuleCache<'c>, error_message: &'static str,
 ) -> UnificationResult<'c> {
     if vec1.len() != vec2.len() {
@@ -909,14 +932,16 @@ pub fn try_unify_all_with_bindings<'c>(
 }
 
 /// Concatenate all the types into a comma-separated string for error messages.
-fn concat_type_strings<'c>(types: &[Type], cache: &ModuleCache<'c>) -> String {
-    let types = fmap(types, |typ| typ.display(cache).to_string());
+fn concat_type_strings<'c>(types: &[Rc<Type>], cache: &ModuleCache<'c>) -> String {
+    let types = fmap(types, |typ| typ.as_ref().display(cache).to_string());
     join_with(&types, ", ")
 }
 
 /// Unifies the two given types, remembering the unification results in the cache.
 /// If this operation fails, a user-facing error message is emitted.
-pub fn unify<'c>(t1: &Type, t2: &Type, location: Location<'c>, cache: &mut ModuleCache<'c>, error_message: &str) {
+pub fn unify<'c>(
+    t1: &Rc<Type>, t2: &Rc<Type>, location: Location<'c>, cache: &mut ModuleCache<'c>, error_message: &str,
+) {
     perform_bindings_or_print_error(try_unify(t1, t2, location, cache, error_message), cache);
 }
 
@@ -1014,7 +1039,7 @@ fn find_all_typevars_in_traits<'a>(traits: &TraitConstraints, cache: &ModuleCach
 
 /// Find all typevars declared inside the current LetBindingLevel and wrap the type in a PolyType
 /// e.g.  generalize (a -> b -> b) = forall a b. a -> b -> b
-fn generalize<'a>(typ: &Type, cache: &ModuleCache<'a>) -> GeneralizedType {
+fn generalize<'a>(typ: &Rc<Type>, cache: &ModuleCache<'a>) -> GeneralizedType {
     let mut typevars = find_all_typevars(typ, true, cache);
     if typevars.is_empty() {
         GeneralizedType::MonoType(typ.clone())
@@ -1118,13 +1143,13 @@ fn bind_closure_environment<'c>(environment: &mut ClosureEnvironment, cache: &mu
     }
 }
 
-fn infer_closure_environment<'c>(environment: &ClosureEnvironment, cache: &mut ModuleCache<'c>) -> Type {
+fn infer_closure_environment<'c>(environment: &ClosureEnvironment, cache: &mut ModuleCache<'c>) -> Rc<Type> {
     let mut environment =
         fmap(environment, |(_from, (_, to, _))| cache[*to].typ.as_ref().unwrap().clone().into_monotype());
 
     if environment.is_empty() {
         // Non-closure functions have an environment of type unit
-        Type::UNIT
+        Rc::new(Type::UNIT)
     } else if environment.len() == 1 {
         environment.pop().unwrap()
     } else {
@@ -1136,14 +1161,14 @@ fn infer_closure_environment<'c>(environment: &ClosureEnvironment, cache: &mut M
 /// given Vec of types. Since this is made from nested pairs
 /// and includes no type terminator, it requires at least 2
 /// types to be passed in.
-fn make_tuple_type(mut types: Vec<Type>) -> Type {
+fn make_tuple_type(mut types: Vec<Rc<Type>>) -> Rc<Type> {
     assert!(types.len() > 1);
     let mut ret = types.pop().unwrap();
 
     while !types.is_empty() {
         let typ = types.pop().unwrap();
-        let pair = Box::new(Type::UserDefined(PAIR_TYPE));
-        ret = Type::TypeApplication(pair, vec![typ, ret]);
+        let pair = Rc::new(Type::UserDefined(PAIR_TYPE));
+        ret = Rc::new(Type::TypeApplication(pair, vec![typ, ret]));
     }
 
     ret
@@ -1154,7 +1179,7 @@ fn make_tuple_type(mut types: Vec<Type>) -> Type {
 /// to any variable encountered. Appends the given required_traits list in the DefinitionInfo's
 /// required_traits field.
 pub(super) fn bind_irrefutable_pattern<'c>(
-    ast: &mut ast::Ast<'c>, typ: &Type, required_traits: &[RequiredTrait], should_generalize: bool,
+    ast: &mut ast::Ast<'c>, typ: &Rc<Type>, required_traits: &[RequiredTrait], should_generalize: bool,
     cache: &mut ModuleCache<'c>,
 ) {
     use ast::Ast::*;
@@ -1163,9 +1188,9 @@ pub(super) fn bind_irrefutable_pattern<'c>(
     match ast {
         Literal(literal) => match literal.kind {
             LiteralKind::Unit => {
-                literal.set_type(Type::UNIT);
+                literal.set_type(Rc::new(Type::UNIT));
                 let msg = "Expected a unit type from this pattern, but the corresponding value has the type $1";
-                unify(typ, &Type::UNIT, ast.locate(), cache, msg);
+                unify(typ, &Rc::new(Type::UNIT), ast.locate(), cache, msg);
             },
             _ => error!(ast.locate(), "Pattern is not irrefutable"),
         },
@@ -1203,23 +1228,23 @@ pub(super) fn bind_irrefutable_pattern<'c>(
         // TODO: All struct patterns
         FunctionCall(call) if call.is_pair_constructor() => {
             let args = fmap(&call.args, |_| next_type_variable(cache));
-            let pair_type = Box::new(Type::UserDefined(PAIR_TYPE));
+            let pair_type = Rc::new(Type::UserDefined(PAIR_TYPE));
 
-            let pair_type = Type::TypeApplication(pair_type, args.clone());
+            let pair_type = Rc::new(Type::TypeApplication(pair_type, args.clone()));
             unify(typ, &pair_type, call.location, cache, "Expected a pair type from this pattern, but found $1");
 
-            let function_type = Type::Function(FunctionType {
+            let function_type = Rc::new(Type::Function(FunctionType {
                 parameters: args,
-                return_type: Box::new(pair_type.clone()),
-                environment: Box::new(Type::UNIT),
-                effects: Box::new(next_type_variable(cache)),
+                return_type: pair_type.clone(),
+                environment: Rc::new(Type::UNIT),
+                effects: next_type_variable(cache),
                 is_varargs: false,
-            });
+            }));
 
             call.function.set_type(function_type);
             call.set_type(pair_type.clone());
 
-            match pair_type {
+            match pair_type.as_ref() {
                 Type::TypeApplication(_, args) => {
                     for (element, element_type) in call.args.iter_mut().zip(args) {
                         bind_irrefutable_pattern(element, &element_type, required_traits, should_generalize, cache);
@@ -1570,13 +1595,13 @@ impl<'a> Inferable<'a> for ast::Lambda<'a> {
             infer(self.body.as_mut(), cache)
         };
 
-        let typ = Function(FunctionType {
+        let typ = Rc::new(Function(FunctionType {
             parameters: parameter_types,
-            return_type: Box::new(body.typ),
-            environment: Box::new(infer_closure_environment(&self.closure_environment, cache)),
-            effects: Box::new(Type::Effects(body.effects)),
+            return_type: body.typ,
+            environment: infer_closure_environment(&self.closure_environment, cache),
+            effects: Rc::new(Type::Effects(body.effects)),
             is_varargs: false,
-        });
+        }));
 
         TypeResult::new(typ, body.traits, cache)
     }
@@ -1600,13 +1625,13 @@ impl<'a> Inferable<'a> for ast::FunctionCall<'a> {
         let return_type = next_type_variable(cache);
         let new_effect = f.effects.clone();
 
-        let new_function = Function(FunctionType {
+        let new_function = Rc::new(Function(FunctionType {
             parameters,
-            return_type: Box::new(return_type.clone()),
-            environment: Box::new(next_type_variable(cache)),
-            effects: Box::new(Type::Effects(new_effect)),
+            return_type: return_type.clone(),
+            environment: next_type_variable(cache),
+            effects: Rc::new(Type::Effects(new_effect)),
             is_varargs: false,
-        });
+        }));
 
         // Don't need a match here, but if we already know f is a function type
         // it improves error messages to unify parameter by parameter.
@@ -1619,7 +1644,9 @@ impl<'a> Inferable<'a> for ast::FunctionCall<'a> {
     }
 }
 
-fn issue_argument_types_error<'c>(call: &ast::FunctionCall<'c>, f: Type, args: Type, cache: &mut ModuleCache<'c>) {
+fn issue_argument_types_error<'c>(
+    call: &ast::FunctionCall<'c>, f: Rc<Type>, args: Rc<Type>, cache: &mut ModuleCache<'c>,
+) {
     let (expected, actual) = unwrap_functions(f, args, cache);
 
     if expected.parameters.len() != actual.parameters.len() && !expected.is_varargs && !actual.is_varargs {
@@ -1637,11 +1664,11 @@ fn issue_argument_types_error<'c>(call: &ast::FunctionCall<'c>, f: Type, args: T
     }
 }
 
-fn unwrap_functions(f: Type, new_function: Type, cache: &ModuleCache) -> (FunctionType, FunctionType) {
+fn unwrap_functions(f: Rc<Type>, new_function: Rc<Type>, cache: &ModuleCache) -> (FunctionType, FunctionType) {
     let f = follow_bindings_in_cache(&f, cache);
 
-    match (f, new_function) {
-        (Type::Function(f1), Type::Function(f2)) => (f1, f2),
+    match (f.as_ref(), new_function.as_ref()) {
+        (Type::Function(f1), Type::Function(f2)) => (f1.clone(), f2.clone()),
         _ => unreachable!(),
     }
 }
@@ -1654,10 +1681,10 @@ fn unwrap_functions(f: Type, new_function: Type, cache: &ModuleCache) -> (Functi
  */
 impl<'a> Inferable<'a> for ast::Definition<'a> {
     fn infer_impl(&mut self, cache: &mut ModuleCache<'a>) -> TypeResult {
-        let unit = Type::UNIT;
+        let unit = Rc::new(Type::UNIT);
 
         if self.typ.is_some() {
-            return TypeResult::of(unit, cache);
+            return TypeResult::of(Type::UNIT, cache);
         }
 
         // Without this self.typ wouldn't be set yet while inferring the type of self.expr
@@ -1674,7 +1701,7 @@ impl<'a> Inferable<'a> for ast::Definition<'a> {
         let mut result = infer(self.expr.as_mut(), cache);
         if self.mutable {
             let lifetime = next_type_variable_id(cache);
-            result.typ = Type::TypeApplication(Box::new(Type::Ref(lifetime)), vec![result.typ]);
+            result.typ = Rc::new(Type::TypeApplication(Rc::new(Type::Ref(lifetime)), vec![result.typ]));
         }
 
         // The rhs of a Definition must be inferred at a greater LetBindingLevel than
@@ -1712,7 +1739,7 @@ impl<'a> Inferable<'a> for ast::Definition<'a> {
 impl<'a> Inferable<'a> for ast::If<'a> {
     fn infer_impl(&mut self, cache: &mut ModuleCache<'a>) -> TypeResult {
         let mut result = infer(self.condition.as_mut(), cache);
-        let bool_type = Type::Primitive(PrimitiveType::BooleanType);
+        let bool_type = Rc::new(Type::Primitive(PrimitiveType::BooleanType));
 
         let msg = "$1 should be a bool to be used in an if condition";
         unify(&result.typ, &bool_type, self.condition.locate(), cache, msg);
@@ -1728,7 +1755,7 @@ impl<'a> Inferable<'a> for ast::If<'a> {
             unify(&then.typ, &otherwise.typ, self.location, cache, msg);
             result.with_type(then.typ)
         } else {
-            result.with_type(Type::UNIT)
+            result.with_bare_type(Type::UNIT)
         }
     }
 }
@@ -1938,7 +1965,7 @@ impl<'a> Inferable<'a> for ast::MemberAccess<'a> {
 
         // The '..' or 'rest of the struct' stand-in variable
         let rho = cache.next_type_variable_id(level);
-        let struct_type = Type::Struct(fields, rho);
+        let struct_type = Rc::new(Type::Struct(fields, rho));
 
         let msg = &format!("$1 has no field {} of type $2", self.field);
         unify(&result.typ, &struct_type, self.location, cache, msg);
@@ -1958,31 +1985,34 @@ impl<'a> Inferable<'a> for ast::Assignment<'a> {
         result.combine(&mut rhs, cache);
 
         let lifetime = next_type_variable_id(cache);
-        let mutref = Type::TypeApplication(Box::new(Type::Ref(lifetime)), vec![rhs.typ.clone()]);
+        let mutref = Rc::new(Type::TypeApplication(Rc::new(Type::Ref(lifetime)), vec![rhs.typ.clone()]));
 
         match try_unify(&result.typ, &mutref, self.location, cache, "never shown") {
             Ok(bindings) => bindings.perform(cache),
             Err(_) => issue_assignment_error(&result.typ, self.lhs.locate(), &rhs.typ, self.location, cache),
         }
 
-        result.with_type(Type::UNIT)
+        result.with_bare_type(Type::UNIT)
     }
 }
 
 fn issue_assignment_error<'c>(
-    lhs: &Type, lhs_loc: Location<'c>, rhs: &Type, location: Location<'c>, cache: &mut ModuleCache<'c>,
+    lhs: &Rc<Type>, lhs_loc: Location<'c>, rhs: &Rc<Type>, location: Location<'c>, cache: &mut ModuleCache<'c>,
 ) {
     // Try to offer a more specific error message
     let lifetime = next_type_variable_id(cache);
     let var = next_type_variable(cache);
-    let mutref = Type::TypeApplication(Box::new(Type::Ref(lifetime)), vec![var]);
+    let mutref = Rc::new(Type::TypeApplication(Rc::new(Type::Ref(lifetime)), vec![var]));
 
     let msg = "Expression of type $1 must be a `ref a` type to be assigned to";
     if let Err(msg) = try_unify(&lhs, &mutref, lhs_loc, cache, msg) {
         eprintln!("{}", msg);
     } else {
-        let inner_type = match follow_bindings_in_cache(&lhs, cache) {
-            TypeApplication(_, mut args) => args.remove(0),
+        let inner_type = match follow_bindings_in_cache(&lhs, cache).as_ref() {
+            TypeApplication(_, ref args) => {
+                let mut args = args.clone();
+                args.remove(0)
+            },
             _ => unreachable!(),
         };
 
@@ -1997,7 +2027,7 @@ impl<'a> Inferable<'a> for ast::EffectDefinition<'a> {
         let previous_level = CURRENT_LEVEL.swap(self.level.unwrap().0, Ordering::SeqCst);
 
         let effect_id = self.effect_info.unwrap();
-        let effect_args = fmap(&cache[effect_id].typeargs, |id| TypeVariable(*id));
+        let effect_args = fmap(&cache[effect_id].typeargs, |id| Rc::new(TypeVariable(*id)));
 
         for declaration in self.declarations.iter_mut() {
             let rhs = declaration.typ.as_ref().unwrap();
@@ -2015,15 +2045,15 @@ impl<'a> Inferable<'a> for ast::EffectDefinition<'a> {
     }
 }
 
-fn inject_effect(id: DefinitionInfoId, effect_id: EffectInfoId, effect_args: Vec<Type>, cache: &mut ModuleCache) {
+fn inject_effect(id: DefinitionInfoId, effect_id: EffectInfoId, effect_args: Vec<Rc<Type>>, cache: &mut ModuleCache) {
     let info = &mut cache[id];
     let typ = info.typ.take().unwrap().into_monotype();
 
-    match &typ {
+    match typ.as_ref() {
         Type::Function(f) => {
-            let current_effects = f.effects.as_ref();
+            let current_effects = &f.effects;
             let location = info.location;
-            let extra_effect = Type::Effects(EffectSet::single(effect_id, effect_args, cache));
+            let extra_effect = Rc::new(Type::Effects(EffectSet::single(effect_id, effect_args, cache)));
             unify(current_effects, &extra_effect, location, cache, "ICE: This error should never be shown");
 
             let generalized = generalize(&typ, cache);

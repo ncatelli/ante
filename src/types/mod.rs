@@ -6,6 +6,8 @@
 //! definition of a user-defined type.
 use std::collections::BTreeMap;
 
+use std::rc::Rc;
+
 use crate::cache::{DefinitionInfoId, ModuleCache};
 use crate::error::location::{Locatable, Location};
 use crate::lexer::token::IntegerKind;
@@ -52,12 +54,12 @@ pub enum PrimitiveType {
 /// polymorphic over raw function types and closures.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct FunctionType {
-    pub parameters: Vec<Type>,
-    pub return_type: Box<Type>,
-    pub environment: Box<Type>,
+    pub parameters: Vec<Rc<Type>>,
+    pub return_type: Rc<Type>,
+    pub environment: Rc<Type>,
 
     /// Expected to be a Type::Effects or Type::TypeVariable only
-    pub effects: Box<Type>,
+    pub effects: Rc<Type>,
     pub is_varargs: bool,
 }
 
@@ -95,7 +97,7 @@ pub enum Type {
     UserDefined(TypeInfoId),
 
     /// Any type in the form `constructor arg1 arg2 ... argN`
-    TypeApplication(Box<Type>, Vec<Type>),
+    TypeApplication(Rc<Type>, Vec<Rc<Type>>),
 
     /// A region-allocated reference to some data.
     /// Contains a region variable that is unified with other refs during type
@@ -106,7 +108,7 @@ pub enum Type {
     /// the type variable used here replaces the entire type if bound.
     /// This makes it so we don't have to remember previous types to combine
     /// when traversing bindings.
-    Struct(BTreeMap<String, Type>, TypeVariableId),
+    Struct(BTreeMap<String, Rc<Type>>, TypeVariableId),
 
     /// Effects are not the same kind (*) as most Type variants, but
     /// are included in it since they are still valid in a type position
@@ -114,10 +116,16 @@ pub enum Type {
     Effects(EffectSet),
 }
 
+impl AsRef<Type> for Type {
+    fn as_ref(&self) -> &Type {
+        &self
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum GeneralizedType {
     /// A non-generic type
-    MonoType(Type),
+    MonoType(Rc<Type>),
 
     /// A generic type in the form `forall vars. typ`.
     /// These are used internally to indicate polymorphic
@@ -126,7 +134,7 @@ pub enum GeneralizedType {
     /// the Vec is polymorphic in the Box<Type>. This differentiates
     /// generic terms from normal terms whose types are
     /// just type variables of unknown types yet to be inferenced.
-    PolyType(Vec<TypeVariableId>, Type),
+    PolyType(Vec<TypeVariableId>, Rc<Type>),
 }
 
 impl Type {
@@ -170,14 +178,16 @@ impl Type {
 
     /// Pretty-print each type with each typevar substituted for a, b, c, etc.
     pub fn display<'a, 'b>(&self, cache: &'a ModuleCache<'b>) -> typeprinter::TypePrinter<'a, 'b> {
-        let typ = GeneralizedType::MonoType(self.clone());
+        let typ_rc = Rc::new(self.clone());
+        let typ = GeneralizedType::MonoType(typ_rc);
         TypePrinter::display_type(typ, cache)
     }
 
     /// Like display but show the real unique TypeVariableId for each typevar instead
     #[allow(dead_code)]
     pub fn debug<'a, 'b>(&self, cache: &'a ModuleCache<'b>) -> typeprinter::TypePrinter<'a, 'b> {
-        let typ = GeneralizedType::MonoType(self.clone());
+        let typ_rc = Rc::new(self.clone());
+        let typ = GeneralizedType::MonoType(typ_rc);
         TypePrinter::debug_type(typ, cache)
     }
 }
@@ -214,21 +224,21 @@ impl GeneralizedType {
         self.remove_forall().is_union_constructor(cache)
     }
 
-    pub fn remove_forall(&self) -> &Type {
+    pub fn remove_forall(&self) -> &Rc<Type> {
         match self {
             GeneralizedType::MonoType(typ) => typ,
             GeneralizedType::PolyType(_, typ) => typ,
         }
     }
 
-    pub fn into_monotype(self) -> Type {
+    pub fn into_monotype(self) -> Rc<Type> {
         match self {
             GeneralizedType::MonoType(typ) => typ,
             GeneralizedType::PolyType(_, _) => unreachable!(),
         }
     }
 
-    pub fn as_monotype(&self) -> &Type {
+    pub fn as_monotype(&self) -> &Rc<Type> {
         match self {
             GeneralizedType::MonoType(typ) => typ,
             GeneralizedType::PolyType(_, _) => unreachable!(),
@@ -262,14 +272,14 @@ pub const INITIAL_LEVEL: usize = 1;
 /// can be generalized.
 #[derive(Debug)]
 pub enum TypeBinding {
-    Bound(Type),
+    Bound(Rc<Type>),
     Unbound(LetBindingLevel, Kind),
 }
 
 #[derive(Debug)]
 pub struct TypeConstructor<'a> {
     pub name: String,
-    pub args: Vec<Type>,
+    pub args: Vec<Rc<Type>>,
     pub id: DefinitionInfoId,
     pub location: Location<'a>,
 }
@@ -277,7 +287,7 @@ pub struct TypeConstructor<'a> {
 #[derive(Debug)]
 pub struct Field<'a> {
     pub name: String,
-    pub field_type: Type,
+    pub field_type: Rc<Type>,
     pub location: Location<'a>,
 }
 
@@ -299,7 +309,7 @@ pub const PAIR_TYPE: TypeInfoId = TypeInfoId(1);
 pub enum TypeInfoBody<'a> {
     Union(Vec<TypeConstructor<'a>>),
     Struct(Vec<Field<'a>>),
-    Alias(Type),
+    Alias(Rc<Type>),
     Unknown,
 }
 

@@ -11,6 +11,7 @@ use crate::types::{FunctionType, PrimitiveType, Type, TypeBinding, TypeInfoId, T
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Debug, Display, Formatter};
+use std::rc::Rc;
 
 use colored::*;
 
@@ -61,7 +62,7 @@ fn fill_typevar_map(map: &mut HashMap<TypeVariableId, String>, typevars: Vec<Typ
 /// name in both. Printing out the type separately from the traits would cause type variable
 /// naming to restart at `a` which may otherwise give them different names.
 pub fn show_type_and_traits<'b>(
-    typ: &GeneralizedType, traits: &[RequiredTrait], trait_info: &Option<(TraitInfoId, Vec<Type>)>,
+    typ: &GeneralizedType, traits: &[RequiredTrait], trait_info: &Option<(TraitInfoId, Vec<Rc<Type>>)>,
     cache: &ModuleCache<'b>,
 ) -> (String, Vec<String>) {
     let mut map = HashMap::new();
@@ -153,8 +154,8 @@ impl<'a, 'b> TypePrinter<'a, 'b> {
         }
     }
 
-    fn fmt_type(&self, typ: &Type, f: &mut Formatter) -> std::fmt::Result {
-        match typ {
+    fn fmt_type<T: AsRef<Type>>(&self, typ: T, f: &mut Formatter) -> std::fmt::Result {
+        match typ.as_ref() {
             Type::Primitive(primitive) => self.fmt_primitive(primitive, f),
             Type::Function(function) => self.fmt_function(function, f),
             Type::TypeVariable(id) => self.fmt_type_variable(*id, f),
@@ -222,7 +223,7 @@ impl<'a, 'b> TypePrinter<'a, 'b> {
         write!(f, "{}", name)
     }
 
-    fn fmt_type_application(&self, constructor: &Type, args: &[Type], f: &mut Formatter) -> std::fmt::Result {
+    fn fmt_type_application(&self, constructor: &Type, args: &[Rc<Type>], f: &mut Formatter) -> std::fmt::Result {
         write!(f, "{}", "(".blue())?;
 
         if constructor.is_pair_type() {
@@ -238,14 +239,14 @@ impl<'a, 'b> TypePrinter<'a, 'b> {
         write!(f, "{}", ")".blue())
     }
 
-    fn fmt_pair(&self, args: &[Type], f: &mut Formatter) -> std::fmt::Result {
+    fn fmt_pair(&self, args: &[Rc<Type>], f: &mut Formatter) -> std::fmt::Result {
         assert_eq!(args.len(), 2);
 
         self.fmt_type(&args[0], f)?;
 
         write!(f, "{}", ", ".blue())?;
 
-        match &args[1] {
+        match &args[1].as_ref() {
             Type::TypeApplication(constructor, args) if constructor.is_pair_type() => self.fmt_pair(args, f),
             other => self.fmt_type(other, f),
         }
@@ -280,7 +281,7 @@ impl<'a, 'b> TypePrinter<'a, 'b> {
     }
 
     fn fmt_struct(
-        &self, fields: &BTreeMap<String, Type>, rest: TypeVariableId, f: &mut Formatter,
+        &self, fields: &BTreeMap<String, Rc<Type>>, rest: TypeVariableId, f: &mut Formatter,
     ) -> Result<(), std::fmt::Error> {
         match &self.cache.type_bindings[rest.0] {
             TypeBinding::Bound(typ) => self.fmt_type(typ, f),
@@ -306,7 +307,10 @@ impl<'a, 'b> TypePrinter<'a, 'b> {
 
     fn fmt_effects(&self, effects: &EffectSet, f: &mut Formatter) -> std::fmt::Result {
         match &self.cache.type_bindings[effects.replacement.0] {
-            TypeBinding::Bound(Type::Effects(effects)) => return self.fmt_effects(effects, f),
+            TypeBinding::Bound(binding) => match binding.as_ref() {
+                Type::Effects(effects) => return self.fmt_effects(effects, f),
+                _ => (),
+            },
             _ => (),
         }
 

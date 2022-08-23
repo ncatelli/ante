@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use crate::cache::{EffectInfoId, ModuleCache};
 use crate::error::location::Location;
 use crate::types::typechecker::TypeBindings;
@@ -13,7 +15,7 @@ pub struct EffectSet {
     pub replacement: TypeVariableId,
 }
 
-pub type Effect = (EffectInfoId, Vec<Type>);
+pub type Effect = (EffectInfoId, Vec<Rc<Type>>);
 
 impl EffectSet {
     /// Create a new polymorphic effect set
@@ -21,13 +23,13 @@ impl EffectSet {
         EffectSet { effects: vec![], replacement: typechecker::next_type_variable_id(cache) }
     }
 
-    pub fn single(id: EffectInfoId, args: Vec<Type>, cache: &mut ModuleCache) -> EffectSet {
+    pub fn single(id: EffectInfoId, args: Vec<Rc<Type>>, cache: &mut ModuleCache) -> EffectSet {
         let mut set = EffectSet::any(cache);
         set.effects.push((id, args));
         set
     }
 
-    pub fn new(effects: Vec<(EffectInfoId, Vec<Type>)>, cache: &mut ModuleCache) -> EffectSet {
+    pub fn new(effects: Vec<(EffectInfoId, Vec<Rc<Type>>)>, cache: &mut ModuleCache) -> EffectSet {
         let mut set = EffectSet::any(cache);
         set.effects = effects;
         set
@@ -35,7 +37,10 @@ impl EffectSet {
 
     pub fn follow_bindings<'a>(&'a self, cache: &'a ModuleCache) -> &'a Self {
         match &cache.type_bindings[self.replacement.0] {
-            TypeBinding::Bound(Type::Effects(effects)) => effects.follow_bindings(cache),
+            TypeBinding::Bound(binding) => match binding.as_ref() {
+                Type::Effects(effects) => effects.follow_bindings(cache),
+                _ => self,
+            },
             _ => self,
         }
     }
@@ -43,23 +48,38 @@ impl EffectSet {
     pub fn follow_unification_bindings<'a>(
         &'a self, bindings: &'a UnificationBindings, cache: &'a ModuleCache,
     ) -> &'a Self {
-        match &cache.type_bindings[self.replacement.0] {
-            TypeBinding::Bound(Type::Effects(effects)) => effects.follow_unification_bindings(bindings, cache),
+        let binding = &cache.type_bindings[self.replacement.0];
+        match &binding {
+            TypeBinding::Bound(ty) => match ty.as_ref() {
+                Type::Effects(effects) => effects.follow_unification_bindings(bindings, cache),
+                _ => todo!(),
+            },
             _ => match bindings.bindings.get(&self.replacement) {
-                Some(Type::Effects(effects)) => effects.follow_unification_bindings(bindings, cache),
+                Some(ty) => match ty.as_ref() {
+                    Type::Effects(effects) => effects.follow_unification_bindings(bindings, cache),
+                    _ => self,
+                },
                 _ => self,
             },
         }
     }
 
-    pub fn replace_all_typevars_with_bindings(&self, new_bindings: &mut TypeBindings, cache: &mut ModuleCache) -> Type {
-        if let TypeBinding::Bound(Type::Effects(effects)) = &cache.type_bindings[self.replacement.0] {
-            return effects.clone().replace_all_typevars_with_bindings(new_bindings, cache);
+    pub fn replace_all_typevars_with_bindings(
+        &self, new_bindings: &mut TypeBindings, cache: &mut ModuleCache,
+    ) -> Rc<Type> {
+        let ty_binding = &cache.type_bindings[self.replacement.0];
+
+        if let TypeBinding::Bound(bound) = ty_binding {
+            if let Type::Effects(effects) = bound.as_ref() {
+                return effects.clone().replace_all_typevars_with_bindings(new_bindings, cache);
+            }
         }
 
         let replacement = match new_bindings.get(&self.replacement) {
-            Some(Type::TypeVariable(new_id)) => *new_id,
-            Some(other) => return other.clone(),
+            Some(ty) => match ty.as_ref() {
+                Type::TypeVariable(new_id) => *new_id,
+                _ => return ty.clone(),
+            },
             None => typechecker::next_type_variable_id(cache),
         };
 
@@ -67,7 +87,7 @@ impl EffectSet {
             (*id, fmap(args, |arg| typechecker::replace_all_typevars_with_bindings(&arg, new_bindings, cache)))
         });
 
-        Type::Effects(EffectSet { effects, replacement })
+        Rc::new(Type::Effects(EffectSet { effects, replacement }))
     }
 
     /// Replace any typevars found with the given type bindings
@@ -75,12 +95,14 @@ impl EffectSet {
     /// Compared to `replace_all_typevars_with_bindings`, this function does not instantiate
     /// unbound type variables that were not in type_bindings. Thus if type_bindings is empty,
     /// this function will just clone the original EffectSet.
-    pub fn bind_typevars(&self, type_bindings: &TypeBindings, cache: &ModuleCache) -> Type {
+    pub fn bind_typevars(&self, type_bindings: &TypeBindings, cache: &ModuleCache) -> Rc<Type> {
         // type_bindings is checked for bindings before the cache, see the comment
         // in typechecker::bind_typevar
         let replacement = match type_bindings.get(&self.replacement) {
-            Some(Type::TypeVariable(new_id)) => *new_id,
-            Some(other) => return other.clone(),
+            Some(ty) => match ty.as_ref() {
+                Type::TypeVariable(new_id) => *new_id,
+                _ => return ty.clone(),
+            },
             None => self.replacement,
         };
 
@@ -92,7 +114,7 @@ impl EffectSet {
             (*id, fmap(args, |arg| typechecker::bind_typevars(arg, type_bindings, cache)))
         });
 
-        Type::Effects(EffectSet { effects, replacement })
+        Rc::new(Type::Effects(EffectSet { effects, replacement }))
     }
 
     pub fn try_unify_with_bindings(
@@ -110,8 +132,8 @@ impl EffectSet {
         let b_id = b.replacement;
 
         let new_effect = EffectSet::new(new_effects, cache);
-        bindings.bindings.insert(a_id, Type::Effects(new_effect.clone()));
-        bindings.bindings.insert(b_id, Type::Effects(new_effect));
+        bindings.bindings.insert(a_id, Rc::new(Type::Effects(new_effect.clone())));
+        bindings.bindings.insert(b_id, Rc::new(Type::Effects(new_effect)));
     }
 
     pub fn combine(&self, other: &EffectSet, cache: &mut ModuleCache) -> EffectSet {
@@ -127,8 +149,8 @@ impl EffectSet {
         let b_id = b.replacement;
 
         let new_effect = EffectSet::new(new_effects, cache);
-        cache.bind(a_id, Type::Effects(new_effect.clone()));
-        cache.bind(b_id, Type::Effects(new_effect.clone()));
+        cache.bind(a_id, Rc::new(Type::Effects(new_effect.clone())));
+        cache.bind(b_id, Rc::new(Type::Effects(new_effect.clone())));
 
         new_effect
     }
@@ -186,7 +208,7 @@ impl EffectSet {
         let a_id = a.replacement;
 
         let new_effect = EffectSet::new(new_effects, cache);
-        cache.bind(a_id, Type::Effects(new_effect));
+        cache.bind(a_id, Rc::new(Type::Effects(new_effect)));
     }
 }
 

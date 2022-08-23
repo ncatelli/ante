@@ -25,6 +25,7 @@ use crate::util::stdlib_dir;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 mod counter;
 mod unsafecache;
@@ -193,7 +194,7 @@ pub struct DefinitionInfo<'a> {
 
     /// Some((trait_id, trait_args)) if this is a definition from a trait.
     /// Note that this is still None for definitions from trait impls.
-    pub trait_info: Option<(TraitInfoId, Vec<Type>)>,
+    pub trait_info: Option<(TraitInfoId, Vec<Rc<Type>>)>,
 
     /// For a given definition like:
     /// foo (a: a) -> a
@@ -323,7 +324,7 @@ pub struct ImplInfoId(pub usize);
 #[derive(Debug)]
 pub struct ImplInfo<'a> {
     pub trait_id: TraitInfoId,
-    pub typeargs: Vec<Type>,
+    pub typeargs: Vec<Rc<Type>>,
     pub location: Location<'a>,
     pub definitions: Vec<DefinitionInfoId>,
 
@@ -443,9 +444,9 @@ impl<'a> ModuleCache<'a> {
         TypeVariableId(id)
     }
 
-    pub fn next_type_variable(&mut self, level: LetBindingLevel) -> Type {
+    pub fn next_type_variable(&mut self, level: LetBindingLevel) -> Rc<Type> {
         let id = self.next_type_variable_id(level);
-        Type::TypeVariable(id)
+        Rc::new(Type::TypeVariable(id))
     }
 
     pub fn push_trait_definition(
@@ -466,7 +467,7 @@ impl<'a> ModuleCache<'a> {
     }
 
     pub fn push_trait_impl(
-        &mut self, trait_id: TraitInfoId, typeargs: Vec<Type>, definitions: Vec<DefinitionInfoId>,
+        &mut self, trait_id: TraitInfoId, typeargs: Vec<Rc<Type>>, definitions: Vec<DefinitionInfoId>,
         trait_impl: &'a mut TraitImpl<'a>, given: Vec<ConstraintSignature>, location: Location<'a>,
     ) -> ImplInfoId {
         let id = self.impl_infos.len();
@@ -615,7 +616,7 @@ impl<'a> ModuleCache<'a> {
         }
     }
 
-    pub fn bind(&mut self, id: TypeVariableId, binding: Type) {
+    pub fn bind(&mut self, id: TypeVariableId, binding: Rc<Type>) {
         self.type_bindings[id.0] = TypeBinding::Bound(binding);
     }
 }

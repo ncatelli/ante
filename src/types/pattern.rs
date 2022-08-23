@@ -19,6 +19,7 @@ use crate::types::{typechecker, PrimitiveType, Type, TypeInfoBody, TypeInfoId, S
 use crate::util::{fmap, join_with, unwrap_clone};
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 
 use super::GeneralizedType;
 
@@ -284,9 +285,11 @@ fn get_type_info_id(typ: &Type) -> TypeInfoId {
 fn get_variant_type_from_constructor(constructor_id: DefinitionInfoId, cache: &ModuleCache) -> TypeInfoId {
     let constructor_type = &cache.definition_infos[constructor_id.0].typ;
     match constructor_type.as_ref().map(GeneralizedType::remove_forall) {
-        Some(Type::Function(function)) => get_type_info_id(function.return_type.as_ref()),
-        Some(Type::UserDefined(id)) => *id,
-        Some(other) => get_type_info_id(other),
+        Some(typ) => match typ.as_ref() {
+            Type::Function(function) => get_type_info_id(function.return_type.as_ref()),
+            Type::UserDefined(id) => *id,
+            _ => get_type_info_id(typ),
+        },
         None => unreachable!(),
     }
 }
@@ -807,7 +810,7 @@ impl DecisionTree {
     /// Fill in the types of any DefinitionInfoIds created while compiling the decision
     /// tree. This need not be a separate step, but is done here to simplify initial
     /// creation of the tree.
-    pub fn infer<'c>(&mut self, typ: &Type, location: Location<'c>, cache: &mut ModuleCache<'c>) {
+    pub fn infer<'c>(&mut self, typ: &Rc<Type>, location: Location<'c>, cache: &mut ModuleCache<'c>) {
         match self {
             DecisionTree::Leaf(_) => (),
             DecisionTree::Fail => (),
@@ -860,7 +863,7 @@ impl DecisionTree {
     }
 }
 
-fn set_type<'c>(id: DefinitionInfoId, expected: &Type, location: Location<'c>, cache: &mut ModuleCache<'c>) {
+fn set_type<'c>(id: DefinitionInfoId, expected: &Rc<Type>, location: Location<'c>, cache: &mut ModuleCache<'c>) {
     let definition = &mut cache.definition_infos[id.0];
     match &definition.typ {
         Some(definition_type) => {
@@ -887,7 +890,7 @@ fn set_type<'c>(id: DefinitionInfoId, expected: &Type, location: Location<'c>, c
 /// not a function type like (Some : a -> Maybe a) (and thus has no arguments like None : Maybe a)
 /// then we can skip this step completely.
 fn unify_constructor_type<'c, 'a>(
-    constructor: &'a Type, expected: &Type, location: Location<'c>, cache: &mut ModuleCache<'c>,
+    constructor: &'a Type, expected: &Rc<Type>, location: Location<'c>, cache: &mut ModuleCache<'c>,
 ) {
     // If it is not a function, there are no arguments, so there's no need to unify the type with
     // the expected type. We could unify to assert they're equal but this would incur a runtime cost.
@@ -904,30 +907,30 @@ fn unify_constructor_type<'c, 'a>(
 
 /// Returns the parameters of a type. If the type is not a
 /// Type::Function then this returns `vec![typ]`.
-fn parameters_of_type(typ: &Type) -> Vec<&Type> {
-    match typ {
+fn parameters_of_type(typ: &Rc<Type>) -> Vec<&Rc<Type>> {
+    match typ.as_ref() {
         Type::Function(function) => function.parameters.iter().collect(),
         _ => vec![typ],
     }
 }
 
 impl Case {
-    fn get_constructor_type<'c>(&self, expected_type: &Type, cache: &mut ModuleCache<'c>) -> Type {
+    fn get_constructor_type<'c>(&self, expected_type: &Rc<Type>, cache: &mut ModuleCache<'c>) -> Rc<Type> {
         use VariantTag::*;
         match &self.tag {
             Some(UserDefined(id)) => {
                 let constructor_type = unwrap_clone(&cache.definition_infos[id.0].typ);
                 constructor_type.instantiate(vec![], cache).0
             },
-            Some(Literal(LiteralKind::Integer(_, kind))) => Type::Primitive(PrimitiveType::IntegerType(*kind)),
-            Some(Literal(LiteralKind::Float(_))) => Type::Primitive(PrimitiveType::FloatType),
-            Some(Literal(LiteralKind::String(_))) => Type::UserDefined(STRING_TYPE),
-            Some(Literal(LiteralKind::Char(_))) => Type::Primitive(PrimitiveType::CharType),
+            Some(Literal(LiteralKind::Integer(_, kind))) => Rc::new(Type::Primitive(PrimitiveType::IntegerType(*kind))),
+            Some(Literal(LiteralKind::Float(_))) => Rc::new(Type::Primitive(PrimitiveType::FloatType)),
+            Some(Literal(LiteralKind::String(_))) => Rc::new(Type::UserDefined(STRING_TYPE)),
+            Some(Literal(LiteralKind::Char(_))) => Rc::new(Type::Primitive(PrimitiveType::CharType)),
             Some(Literal(LiteralKind::Bool(_))) => unreachable!(),
             Some(Literal(LiteralKind::Unit)) => unreachable!(),
-            Some(True) => Type::Primitive(PrimitiveType::BooleanType),
-            Some(False) => Type::Primitive(PrimitiveType::BooleanType),
-            Some(VariantTag::Unit) => Type::UNIT,
+            Some(True) => Rc::new(Type::Primitive(PrimitiveType::BooleanType)),
+            Some(False) => Rc::new(Type::Primitive(PrimitiveType::BooleanType)),
+            Some(VariantTag::Unit) => Rc::new(Type::UNIT),
             None => expected_type.clone(),
         }
     }

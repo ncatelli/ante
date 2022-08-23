@@ -3,18 +3,19 @@
 //! AST nodes.
 use crate::parser::ast::*;
 use crate::types::Type;
+use std::rc::Rc;
 
 pub trait Typed {
-    fn get_type(&self) -> Option<&Type>;
-    fn set_type(&mut self, typ: Type);
+    fn get_type(&self) -> Option<&Rc<Type>>;
+    fn set_type(&mut self, typ: Rc<Type>);
 }
 
 impl<'a> Typed for Ast<'a> {
-    fn get_type(&self) -> Option<&Type> {
+    fn get_type(&self) -> Option<&Rc<Type>> {
         dispatch_on_expr!(self, Typed::get_type)
     }
 
-    fn set_type(&mut self, typ: Type) {
+    fn set_type(&mut self, typ: Rc<Type>) {
         dispatch_on_expr!(self, Typed::set_type, typ)
     }
 }
@@ -22,11 +23,11 @@ impl<'a> Typed for Ast<'a> {
 macro_rules! impl_typed_for {
     ( $name:tt ) => {
         impl<'a> Typed for $name<'a> {
-            fn get_type(&self) -> Option<&Type> {
+            fn get_type(&self) -> Option<&Rc<Type>> {
                 self.typ.as_ref()
             }
 
-            fn set_type(&mut self, typ: Type) {
+            fn set_type(&mut self, typ: Rc<Type>) {
                 self.typ = Some(typ);
             }
         }

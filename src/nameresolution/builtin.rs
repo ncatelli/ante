@@ -14,6 +14,7 @@ use crate::types::{
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 /// The DefinitionInfoId of the `builtin` symbol is defined to be
 /// the first id. This invariant needs to be maintained by the
@@ -47,13 +48,13 @@ pub fn define_builtins(cache: &mut ModuleCache) {
     let a = cache.next_type_variable_id(LetBindingLevel(1));
     let e = cache.next_type_variable_id(LetBindingLevel(1));
 
-    let builtin_fn_type = Type::Function(FunctionType {
+    let builtin_fn_type = Rc::new(Type::Function(FunctionType {
         parameters: vec![string_type],
-        return_type: Box::new(Type::TypeVariable(a)),
-        environment: Box::new(Type::UNIT),
-        effects: Box::new(Type::TypeVariable(e)),
+        return_type: Rc::new(Type::TypeVariable(a)),
+        environment: Rc::new(Type::UNIT),
+        effects: Rc::new(Type::TypeVariable(e)),
         is_varargs: true,
-    });
+    }));
 
     let builtin_type = GeneralizedType::PolyType(vec![a, e], builtin_fn_type);
     cache.definition_infos[id.0].typ = Some(builtin_type);
@@ -92,19 +93,19 @@ pub fn import_prelude<'a>(resolver: &mut NameResolver, cache: &mut ModuleCache<'
 /// The builtin string type is defined here as:
 ///
 /// type string = c_string: Ptr char, length: usz
-fn define_string(cache: &mut ModuleCache) -> Type {
+fn define_string(cache: &mut ModuleCache) -> Rc<Type> {
     let location = Location::builtin();
 
-    let ptr_type = Type::Primitive(PrimitiveType::Ptr);
-    let char_type = Type::Primitive(PrimitiveType::CharType);
-    let c_string_type = Type::TypeApplication(Box::new(ptr_type), vec![char_type]);
+    let ptr_type = Rc::new(Type::Primitive(PrimitiveType::Ptr));
+    let char_type = Rc::new(Type::Primitive(PrimitiveType::CharType));
+    let c_string_type = Rc::new(Type::TypeApplication(ptr_type, vec![char_type]));
 
-    let length_type = Type::Primitive(PrimitiveType::IntegerType(IntegerKind::Usz));
+    let length_type = Rc::new(Type::Primitive(PrimitiveType::IntegerType(IntegerKind::Usz)));
 
     let name = "string".to_string();
     let string_id = cache.push_type_info(name.clone(), vec![], location);
     assert_eq!(string_id, STRING_TYPE);
-    let string = Type::UserDefined(STRING_TYPE);
+    let string = Rc::new(Type::UserDefined(STRING_TYPE));
 
     let fields = TypeInfoBody::Struct(vec![
         Field { name: "c_string".into(), field_type: c_string_type.clone(), location },
@@ -116,13 +117,13 @@ fn define_string(cache: &mut ModuleCache) -> Type {
 
     let effects = cache.next_type_variable_id(LetBindingLevel(1));
 
-    let constructor_type = Type::Function(FunctionType {
+    let constructor_type = Rc::new(Type::Function(FunctionType {
         parameters: vec![c_string_type, length_type],
-        return_type: Box::new(string.clone()),
-        environment: Box::new(Type::UNIT),
-        effects: Box::new(Type::TypeVariable(effects)),
+        return_type: string.clone(),
+        environment: Rc::new(Type::UNIT),
+        effects: Rc::new(Type::TypeVariable(effects)),
         is_varargs: false,
-    });
+    }));
 
     let polytype = GeneralizedType::PolyType(vec![effects], constructor_type);
 
@@ -147,27 +148,30 @@ fn define_pair(cache: &mut ModuleCache) {
     let pair = cache.push_type_info(name.clone(), vec![], location);
     assert_eq!(pair, PAIR_TYPE);
 
+    let typ_var_a = Rc::new(Type::TypeVariable(a));
+    let typ_var_b = Rc::new(Type::TypeVariable(b));
+
     cache.type_infos[pair.0].body = TypeInfoBody::Struct(vec![
-        Field { name: "first".into(), field_type: Type::TypeVariable(a), location },
-        Field { name: "second".into(), field_type: Type::TypeVariable(b), location },
+        Field { name: "first".into(), field_type: typ_var_a.clone(), location },
+        Field { name: "second".into(), field_type: typ_var_b.clone(), location },
     ]);
 
     cache.type_infos[pair.0].args = vec![a, b];
 
     // The type is defined, now we define the constructor
-    let parameters = vec![Type::TypeVariable(a), Type::TypeVariable(b)];
-    let pair = Box::new(Type::UserDefined(pair));
-    let pair_a_b = Box::new(Type::TypeApplication(pair, parameters.clone()));
+    let parameters = vec![typ_var_a, typ_var_b];
+    let pair = Rc::new(Type::UserDefined(pair));
+    let pair_a_b = Rc::new(Type::TypeApplication(pair, parameters.clone()));
 
     let e = cache.next_type_variable_id(level);
 
-    let constructor_type = Type::Function(FunctionType {
+    let constructor_type = Rc::new(Type::Function(FunctionType {
         parameters,
         return_type: pair_a_b,
-        environment: Box::new(Type::UNIT),
-        effects: Box::new(Type::TypeVariable(e)),
+        environment: Rc::new(Type::UNIT),
+        effects: Rc::new(Type::TypeVariable(e)),
         is_varargs: false,
-    });
+    }));
 
     let constructor_type = GeneralizedType::PolyType(vec![a, b, e], constructor_type);
 
